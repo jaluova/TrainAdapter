@@ -229,11 +229,11 @@ if panel_root.exists():
             except Exception:
                 manifest = None
 
-        latest_panel = {
+        latest_panel = {{
             "dir": str(panel_dir),
             "manifest": manifest,
             "samples": samples,
-        }
+        }}
 
 payload = {{
     "timestamp": int(float(Path("/proc/uptime").read_text().split()[0])) if Path("/proc/uptime").exists() else None,
