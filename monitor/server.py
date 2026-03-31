@@ -114,18 +114,18 @@ for line in lines:
     if step_match:
         step, loss, avg_loss, relation_loss = step_match.groups()
         last_seen_step = int(step)
-        step_history.append({
+        step_history.append({{
             "step": last_seen_step,
             "loss": float(loss),
             "avg_loss": float(avg_loss),
             "relation_loss": float(relation_loss) if relation_loss else None,
-        })
+        }})
         continue
 
     val_match = val_pattern.search(line)
     if val_match:
         val_loss, min_dist, acc1, acc4, rel_acc4 = val_match.groups()
-        val_history.append({
+        val_history.append({{
             "step": last_seen_step,
             "loss": float(val_loss),
             "mean_min_grid_distance": float(min_dist),
@@ -135,16 +135,16 @@ for line in lines:
             "acc_1grid_value": parse_percent(acc1),
             "acc_top4_value": parse_percent(acc4),
             "relation_acc_top4_value": parse_percent(rel_acc4),
-        })
+        }})
         continue
 
     epoch_match = epoch_pattern.search(line)
     if epoch_match:
         current_epoch, total_epochs = epoch_match.groups()
-        epoch_info = {
+        epoch_info = {{
             "current_epoch": int(current_epoch),
             "total_epochs": int(total_epochs),
-        }
+        }}
 
 latest_step = None
 if step_history:
