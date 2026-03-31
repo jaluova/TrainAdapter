@@ -93,6 +93,12 @@
         grid-template-columns: 1.2fr 0.8fr;
         gap: 16px;
       }
+      .chart-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 16px;
+        margin-bottom: 18px;
+      }
       .panel-title {
         margin: 0 0 12px;
         font-size: 18px;
@@ -113,6 +119,66 @@
       }
       li {
         margin: 0 0 8px;
+      }
+      .process-summary {
+        display: grid;
+        gap: 10px;
+      }
+      .process-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 8px 0;
+        border-bottom: 1px dashed var(--line);
+      }
+      .process-row:last-child {
+        border-bottom: 0;
+        padding-bottom: 0;
+      }
+      .process-key {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .process-value {
+        text-align: right;
+        font-size: 14px;
+      }
+      .process-command {
+        margin-top: 10px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: #f4f8ef;
+        border: 1px solid var(--line);
+        font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.5;
+        word-break: break-word;
+      }
+      .chart-meta {
+        color: var(--muted);
+        font-size: 13px;
+        margin-bottom: 10px;
+      }
+      .chart-wrap {
+        height: 180px;
+        border-radius: 14px;
+        overflow: hidden;
+        background:
+          linear-gradient(180deg, rgba(47, 122, 78, 0.08), rgba(47, 122, 78, 0.01)),
+          var(--panel);
+        border: 1px solid var(--line);
+      }
+      .chart-wrap svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .chart-empty {
+        color: var(--muted);
+        font-size: 14px;
+        display: grid;
+        place-items: center;
+        height: 100%;
       }
       @media (max-width: 900px) {
         .two {
@@ -154,6 +220,19 @@
         </div>
       </div>
 
+      <div class="chart-grid">
+        <div class="card">
+          <h2 class="panel-title">Loss Curve</h2>
+          <div class="chart-meta" id="lossChartMeta">最近 120 个训练点</div>
+          <div class="chart-wrap" id="lossChart"></div>
+        </div>
+        <div class="card">
+          <h2 class="panel-title">Validation Curve</h2>
+          <div class="chart-meta" id="valChartMeta">最近 40 个验证点</div>
+          <div class="chart-wrap" id="valChart"></div>
+        </div>
+      </div>
+
       <div class="two">
         <div class="card">
           <h2 class="panel-title">Recent Log</h2>
@@ -162,7 +241,7 @@
         <div>
           <div class="card" style="margin-bottom: 16px;">
             <h2 class="panel-title">Processes</h2>
-            <pre id="processes">-</pre>
+            <div id="processes" class="process-summary">-</div>
           </div>
           <div class="card">
             <h2 class="panel-title">Recent Checkpoints</h2>
@@ -181,6 +260,91 @@
         node.innerHTML = `<span class="dot"></span><span>${text}</span>`;
       }
 
+      function renderProcesses(summary) {
+        if (!summary || !summary.running) {
+          el("processes").innerHTML = '<div class="small">无训练进程</div>';
+          return;
+        }
+
+        const rows = [
+          ["Main PID", summary.main_pid ?? "-"],
+          ["Workers", summary.worker_count ?? 0],
+          ["Launcher", summary.launcher_pid ?? "-"],
+        ];
+
+        const rowHtml = rows.map(([key, value]) => `
+          <div class="process-row">
+            <div class="process-key">${key}</div>
+            <div class="process-value">${value}</div>
+          </div>
+        `).join("");
+
+        const command = summary.command_display || summary.command || "-";
+        el("processes").innerHTML = `
+          <div class="process-summary">
+            ${rowHtml}
+            <div class="process-command">${command}</div>
+          </div>
+        `;
+      }
+
+      function renderLineChart(containerId, metaId, seriesList, fallbackText) {
+        const container = el(containerId);
+        const meta = metaId ? el(metaId) : null;
+        const activeSeries = (seriesList || []).filter((series) => (series.points || []).length > 1);
+
+        if (!activeSeries.length) {
+          container.innerHTML = `<div class="chart-empty">${fallbackText}</div>`;
+          if (meta) meta.textContent = fallbackText;
+          return;
+        }
+
+        const width = 640;
+        const height = 180;
+        const pad = 16;
+        const allPoints = activeSeries.flatMap((series) => series.points);
+        const xs = allPoints.map((point) => point.x);
+        const ys = allPoints.map((point) => point.y);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const xSpan = Math.max(maxX - minX, 1);
+        const ySpan = Math.max(maxY - minY, 1e-6);
+
+        const gridLines = [0.2, 0.4, 0.6, 0.8].map((ratio) => {
+          const y = pad + (height - pad * 2) * ratio;
+          return `<line x1="${pad}" y1="${y}" x2="${width - pad}" y2="${y}" stroke="rgba(91,111,93,0.14)" stroke-width="1" />`;
+        }).join("");
+
+        const paths = activeSeries.map((series) => {
+          const coords = series.points.map((point) => {
+            const x = pad + ((point.x - minX) / xSpan) * (width - pad * 2);
+            const y = height - pad - ((point.y - minY) / ySpan) * (height - pad * 2);
+            return `${x.toFixed(1)},${y.toFixed(1)}`;
+          }).join(" ");
+          return `<polyline fill="none" stroke="${series.color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${coords}" />`;
+        }).join("");
+
+        const legend = activeSeries.map((series, index) => {
+          return `<span style="display:inline-flex;align-items:center;gap:6px;margin-right:14px;">
+            <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${series.color};"></span>
+            <span>${series.label}</span>
+          </span>`;
+        }).join("");
+
+        container.innerHTML = `
+          <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-label="chart">
+            ${gridLines}
+            ${paths}
+          </svg>
+        `;
+
+        if (meta) {
+          meta.innerHTML = legend;
+        }
+      }
+
       function render(payload) {
         if (!payload.ok) {
           setStatus(false, payload.error || "请求失败");
@@ -192,6 +356,8 @@
         const val = data.latest_validation || {};
         const gpuLine = (data.gpu || [])[0] || "";
         const gpuParts = gpuLine.split(",").map((v) => v.trim());
+        const stepHistory = data.step_history || [];
+        const valHistory = data.val_history || [];
 
         setStatus(true, `已连接，最近刷新 ${new Date(payload.last_refresh_epoch_ms).toLocaleTimeString()}`);
         el("step").textContent = latest.step ?? "-";
@@ -207,7 +373,41 @@
         }
 
         el("recentLog").textContent = (data.recent_lines || []).join("\n");
-        el("processes").textContent = (data.processes || []).join("\n") || "无训练进程";
+        renderProcesses(data.process_summary);
+        renderLineChart(
+          "lossChart",
+          "lossChartMeta",
+          [
+            {
+              label: "Loss",
+              color: "#c96a2b",
+              points: stepHistory.map((point) => ({ x: point.step, y: point.loss })),
+            },
+            {
+              label: "Avg Loss",
+              color: "#2f7a4e",
+              points: stepHistory.map((point) => ({ x: point.step, y: point.avg_loss })),
+            },
+          ],
+          "训练曲线暂时还不够"
+        );
+        renderLineChart(
+          "valChart",
+          "valChartMeta",
+          [
+            {
+              label: "Acc@Top4",
+              color: "#2f7a4e",
+              points: valHistory.filter((point) => point.step != null && point.acc_top4_value != null).map((point) => ({ x: point.step, y: point.acc_top4_value })),
+            },
+            {
+              label: "Acc@1Grid",
+              color: "#295f9a",
+              points: valHistory.filter((point) => point.step != null && point.acc_1grid_value != null).map((point) => ({ x: point.step, y: point.acc_1grid_value })),
+            },
+          ],
+          "验证曲线暂时还不够"
+        );
 
         const checkpoints = data.checkpoints || [];
         el("checkpoints").innerHTML = checkpoints.length

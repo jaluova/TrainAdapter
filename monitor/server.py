@@ -15,6 +15,38 @@ INDEX_PATH = ROOT / "index.html"
 REFRESH_SECONDS = float(os.environ.get("TRAIN_MONITOR_REFRESH_SECONDS", "8"))
 
 
+def _compact_command(command: str, limit: int = 140) -> str:
+    parts = command.split()
+    compact_parts: list[str] = []
+    skip_next = False
+
+    for index, part in enumerate(parts):
+        if skip_next:
+            skip_next = False
+            continue
+
+        if part in {"--config", "--resume"} and index + 1 < len(parts):
+            compact_parts.append(part)
+            compact_parts.append(Path(parts[index + 1]).name)
+            skip_next = True
+            continue
+
+        if part.startswith("/") and (part.endswith(".json") or part.endswith(".pth")):
+            compact_parts.append(Path(part).name)
+            continue
+
+        if part.startswith("/") and part.endswith("python"):
+            compact_parts.append("python")
+            continue
+
+        compact_parts.append(part)
+
+    compact = " ".join(compact_parts)
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
 def _required_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -49,57 +81,122 @@ process_pattern = {process_pattern!r}
 def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
 
+def parse_percent(value):
+    value = str(value).strip()
+    if value.endswith("%"):
+        value = value[:-1]
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
 raw = b""
 if log_path.exists():
     raw = log_path.read_bytes().replace(b"\\x00", b"")
 text = raw.decode("utf-8", errors="replace")
 lines = [line for line in text.splitlines() if line.strip()]
 
-step_matches = re.findall(
-    r"Step\\s+(\\d+),\\s+Loss:\\s+([0-9.]+),\\s+Avg Loss:\\s+([0-9.]+)(?:,\\s+Relation Loss:\\s+([0-9.]+))?",
-    text,
+step_pattern = re.compile(
+    r"Step\\s+(\\d+),\\s+Loss:\\s+([0-9.]+),\\s+Avg Loss:\\s+([0-9.]+)(?:,\\s+Relation Loss:\\s+([0-9.]+))?"
 )
-val_matches = re.findall(
-    r"Validation - Loss:\\s+([0-9.]+),\\s+Mean Min Grid Distance:\\s+([0-9.]+),\\s+Acc@1Grid:\\s+([0-9.%]+),\\s+Acc@Top4:\\s+([0-9.%]+),\\s+Relation Acc@Top4:\\s+([0-9.%]+)",
-    text,
+val_pattern = re.compile(
+    r"Validation - Loss:\\s+([0-9.]+),\\s+Mean Min Grid Distance:\\s+([0-9.]+),\\s+Acc@1Grid:\\s+([0-9.%]+),\\s+Acc@Top4:\\s+([0-9.%]+),\\s+Relation Acc@Top4:\\s+([0-9.%]+)"
 )
-epoch_matches = re.findall(r"Epoch\\s+(\\d+)/(\\d+)", text)
+epoch_pattern = re.compile(r"Epoch\\s+(\\d+)/(\\d+)")
+
+step_history = []
+val_history = []
+epoch_info = None
+last_seen_step = None
+
+for line in lines:
+    step_match = step_pattern.search(line)
+    if step_match:
+        step, loss, avg_loss, relation_loss = step_match.groups()
+        last_seen_step = int(step)
+        step_history.append({
+            "step": last_seen_step,
+            "loss": float(loss),
+            "avg_loss": float(avg_loss),
+            "relation_loss": float(relation_loss) if relation_loss else None,
+        })
+        continue
+
+    val_match = val_pattern.search(line)
+    if val_match:
+        val_loss, min_dist, acc1, acc4, rel_acc4 = val_match.groups()
+        val_history.append({
+            "step": last_seen_step,
+            "loss": float(val_loss),
+            "mean_min_grid_distance": float(min_dist),
+            "acc_1grid": acc1,
+            "acc_top4": acc4,
+            "relation_acc_top4": rel_acc4,
+            "acc_1grid_value": parse_percent(acc1),
+            "acc_top4_value": parse_percent(acc4),
+            "relation_acc_top4_value": parse_percent(rel_acc4),
+        })
+        continue
+
+    epoch_match = epoch_pattern.search(line)
+    if epoch_match:
+        current_epoch, total_epochs = epoch_match.groups()
+        epoch_info = {
+            "current_epoch": int(current_epoch),
+            "total_epochs": int(total_epochs),
+        }
 
 latest_step = None
-if step_matches:
-    step, loss, avg_loss, relation_loss = step_matches[-1]
-    latest_step = {{
-        "step": int(step),
-        "loss": float(loss),
-        "avg_loss": float(avg_loss),
-        "relation_loss": float(relation_loss) if relation_loss else None,
-    }}
+if step_history:
+    latest_step = step_history[-1]
 
 latest_val = None
-if val_matches:
-    val_loss, min_dist, acc1, acc4, rel_acc4 = val_matches[-1]
-    latest_val = {{
-        "loss": float(val_loss),
-        "mean_min_grid_distance": float(min_dist),
-        "acc_1grid": acc1,
-        "acc_top4": acc4,
-        "relation_acc_top4": rel_acc4,
-    }}
-
-epoch_info = None
-if epoch_matches:
-    current_epoch, total_epochs = epoch_matches[-1]
-    epoch_info = {{
-        "current_epoch": int(current_epoch),
-        "total_epochs": int(total_epochs),
-    }}
+if val_history:
+    latest_val = val_history[-1]
 
 gpu_csv = run([
     "nvidia-smi",
     "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
     "--format=csv,noheader,nounits",
 ])
-processes = run(["bash", "-lc", f"pgrep -af {{process_pattern!r}} || true"])
+raw_processes = run(["bash", "-lc", f"pgrep -af {{process_pattern!r}} || true"]).splitlines()
+
+filtered_processes = []
+for line in raw_processes:
+    if not line.strip():
+        continue
+    if "pgrep -af" in line:
+        continue
+    filtered_processes.append(line.strip())
+
+launcher = None
+main_process = None
+worker_pids = []
+
+for line in filtered_processes:
+    parts = line.split(" ", 1)
+    if len(parts) != 2:
+        continue
+    pid, command = parts
+    entry = {{"pid": int(pid), "command": command}}
+
+    if "bash -lc" in command and "nohup" in command:
+        launcher = entry
+        continue
+
+    if main_process is None:
+        main_process = entry
+    else:
+        worker_pids.append(int(pid))
+
+process_summary = {{
+    "running": main_process is not None,
+    "launcher_pid": launcher["pid"] if launcher else None,
+    "main_pid": main_process["pid"] if main_process else None,
+    "worker_pids": worker_pids,
+    "worker_count": len(worker_pids),
+    "command": main_process["command"] if main_process else (launcher["command"] if launcher else None),
+}}
 
 checkpoints = []
 checkpoint_dir = save_dir / "checkpoints"
@@ -116,9 +213,12 @@ payload = {{
     "latest_validation": latest_val,
     "epoch_info": epoch_info,
     "gpu": gpu_csv.splitlines(),
-    "processes": processes.splitlines(),
+    "processes": filtered_processes,
+    "process_summary": process_summary,
     "checkpoints": checkpoints,
     "recent_lines": lines[-80:],
+    "step_history": step_history[-120:],
+    "val_history": val_history[-40:],
 }}
 print(json.dumps(payload, ensure_ascii=False))
 """
@@ -178,6 +278,9 @@ class StatusCache:
     def update(self) -> None:
         try:
             remote_payload = _run_remote_command()
+            process_summary = remote_payload.get("process_summary") or {}
+            if process_summary.get("command"):
+                process_summary["command_display"] = _compact_command(process_summary["command"])
             payload = {
                 "ok": True,
                 "last_refresh_epoch_ms": int(time.time() * 1000),
@@ -236,11 +339,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    bind_host = os.environ.get("TRAIN_MONITOR_BIND_HOST", "127.0.0.1")
     port = int(os.environ.get("TRAIN_MONITOR_PORT_LOCAL", "4173"))
     threading.Thread(target=_refresh_loop, daemon=True).start()
     STATUS_CACHE.update()
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Train monitor listening on http://127.0.0.1:{port}")
+    server = ThreadingHTTPServer((bind_host, port), Handler)
+    print(f"Train monitor listening on http://{bind_host}:{port}")
     server.serve_forever()
 
 
