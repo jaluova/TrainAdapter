@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+
+# Local data and experiment artifacts
+Data/
+Data1000/
+Qwen2.5-VL-7B-Instruct/
+visualizations/
+predictions/
+train_outputs/
+*.log
+*.out
+*.pth
