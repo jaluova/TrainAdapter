@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -108,7 +109,7 @@ if checkpoint_dir.exists():
     )[-5:]
 
 payload = {{
-    "timestamp": int(Path("/proc/uptime").read_text().split()[0]) if Path("/proc/uptime").exists() else None,
+    "timestamp": int(float(Path("/proc/uptime").read_text().split()[0])) if Path("/proc/uptime").exists() else None,
     "log_path": str(log_path),
     "save_dir": str(save_dir),
     "latest_step": latest_step,
@@ -135,10 +136,11 @@ def _run_remote_command() -> dict[str, Any]:
         "python -c "
         "\"import base64; exec(base64.b64decode('{}').decode('utf-8'))\"".format(encoded)
     )
+    remote_shell_cmd = f"bash -lc {shlex.quote(remote_cmd)}"
     expect_script = "\n".join(
         [
             "set timeout 40",
-            f"spawn ssh -o StrictHostKeyChecking=no -p {port} {user}@{host} bash -lc {{{remote_cmd}}}",
+            f"spawn ssh -o StrictHostKeyChecking=no -p {port} {user}@{host} {{{remote_shell_cmd}}}",
             'expect "password:" {send "' + password + '\\r"}',
             "expect eof",
         ]
