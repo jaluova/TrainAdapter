@@ -1,0 +1,17 @@
+{
+  "checkpoint": "/root/autodl-tmp/Data/train_outputs/minimal_a100_smoketest/checkpoints/checkpoint_step_370.pth",
+  "config": "/root/autodl-tmp/Data/train_outputs/minimal_a100_smoketest/config.json",
+  "data_root": "/root/autodl-tmp/Data",
+  "annotation_file": "grefs_with_grids.json",
+  "selected_indices": [
+    0,
+    74,
+    148,
+    221,
+    295,
+    369
+  ],
+  "device": "cuda",
+  "checkpoint_step": 370,
+  "checkpoint_loss": 0.3574195057556436
+}
