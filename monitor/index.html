@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TrainAdapter Monitor</title>
+    <style>
+      :root {
+        --bg: #eef3ea;
+        --panel: #fbfcf7;
+        --ink: #17301f;
+        --muted: #5b6f5d;
+        --line: #d5dfd1;
+        --accent: #2f7a4e;
+        --accent-soft: #dff0e4;
+        --warn: #a45721;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+        background:
+          radial-gradient(circle at top left, #f8fcf1 0, transparent 35%),
+          linear-gradient(180deg, #edf4e8 0%, var(--bg) 100%);
+        color: var(--ink);
+      }
+      .wrap {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 28px 20px 40px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 34px;
+        line-height: 1.05;
+      }
+      .sub {
+        color: var(--muted);
+        margin-bottom: 20px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 14px;
+        margin-bottom: 18px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 16px 18px;
+        box-shadow: 0 12px 32px rgba(30, 59, 36, 0.05);
+      }
+      .label {
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 10px;
+      }
+      .value {
+        font-size: 28px;
+        font-weight: 700;
+      }
+      .small {
+        color: var(--muted);
+        font-size: 14px;
+        margin-top: 8px;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border-radius: 999px;
+        padding: 8px 12px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-size: 14px;
+        margin-bottom: 18px;
+      }
+      .status.bad {
+        background: #f8e6dc;
+        color: var(--warn);
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+      .two {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 16px;
+      }
+      .panel-title {
+        margin: 0 0 12px;
+        font-size: 18px;
+      }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.55;
+        max-height: 560px;
+        overflow: auto;
+      }
+      ul {
+        margin: 0;
+        padding-left: 18px;
+      }
+      li {
+        margin: 0 0 8px;
+      }
+      @media (max-width: 900px) {
+        .two {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>TrainAdapter Local Monitor</h1>
+      <div class="sub">本地网页，自动轮询远端 A100 训练日志、GPU 状态和 checkpoint 产出。</div>
+
+      <div id="status" class="status">
+        <span class="dot"></span>
+        <span>连接中…</span>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <div class="label">Latest Step</div>
+          <div id="step" class="value">-</div>
+          <div id="stepMeta" class="small">等待日志</div>
+        </div>
+        <div class="card">
+          <div class="label">Average Loss</div>
+          <div id="avgLoss" class="value">-</div>
+          <div id="relationLoss" class="small">Relation loss: -</div>
+        </div>
+        <div class="card">
+          <div class="label">Epoch</div>
+          <div id="epoch" class="value">-</div>
+          <div id="valMeta" class="small">Validation: -</div>
+        </div>
+        <div class="card">
+          <div class="label">GPU</div>
+          <div id="gpu" class="value" style="font-size: 20px">-</div>
+          <div id="gpuMeta" class="small">-</div>
+        </div>
+      </div>
+
+      <div class="two">
+        <div class="card">
+          <h2 class="panel-title">Recent Log</h2>
+          <pre id="recentLog">等待日志…</pre>
+        </div>
+        <div>
+          <div class="card" style="margin-bottom: 16px;">
+            <h2 class="panel-title">Processes</h2>
+            <pre id="processes">-</pre>
+          </div>
+          <div class="card">
+            <h2 class="panel-title">Recent Checkpoints</h2>
+            <ul id="checkpoints"><li>暂无</li></ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const el = (id) => document.getElementById(id);
+
+      function setStatus(ok, text) {
+        const node = el("status");
+        node.className = ok ? "status" : "status bad";
+        node.innerHTML = `<span class="dot"></span><span>${text}</span>`;
+      }
+
+      function render(payload) {
+        if (!payload.ok) {
+          setStatus(false, payload.error || "请求失败");
+          return;
+        }
+        const data = payload.data;
+        const latest = data.latest_step || {};
+        const epoch = data.epoch_info || {};
+        const val = data.latest_validation || {};
+        const gpuLine = (data.gpu || [])[0] || "";
+        const gpuParts = gpuLine.split(",").map((v) => v.trim());
+
+        setStatus(true, `已连接，最近刷新 ${new Date(payload.last_refresh_epoch_ms).toLocaleTimeString()}`);
+        el("step").textContent = latest.step ?? "-";
+        el("stepMeta").textContent = latest.loss != null ? `Current loss ${latest.loss.toFixed(4)}` : "暂无 step loss";
+        el("avgLoss").textContent = latest.avg_loss != null ? latest.avg_loss.toFixed(4) : "-";
+        el("relationLoss").textContent = latest.relation_loss != null ? `Relation loss: ${latest.relation_loss.toFixed(4)}` : "Relation loss: -";
+        el("epoch").textContent = epoch.current_epoch != null ? `${epoch.current_epoch}/${epoch.total_epochs}` : "-";
+        el("valMeta").textContent = val.acc_top4 ? `Val Acc@Top4 ${val.acc_top4}, Acc@1Grid ${val.acc_1grid}` : "Validation: 暂无";
+
+        if (gpuParts.length >= 5) {
+          el("gpu").textContent = `${gpuParts[1]}% / ${gpuParts[2]} MiB`;
+          el("gpuMeta").textContent = `${gpuParts[0]} | total ${gpuParts[3]} MiB | ${gpuParts[4]}°C`;
+        }
+
+        el("recentLog").textContent = (data.recent_lines || []).join("\n");
+        el("processes").textContent = (data.processes || []).join("\n") || "无训练进程";
+
+        const checkpoints = data.checkpoints || [];
+        el("checkpoints").innerHTML = checkpoints.length
+          ? checkpoints.map((name) => `<li>${name}</li>`).join("")
+          : "<li>暂无 checkpoint</li>";
+      }
+
+      async function refresh() {
+        try {
+          const resp = await fetch("/api/status", { cache: "no-store" });
+          const payload = await resp.json();
+          render(payload);
+        } catch (err) {
+          setStatus(false, String(err));
+        }
+      }
+
+      refresh();
+      setInterval(refresh, 5000);
+    </script>
+  </body>
+</html>
