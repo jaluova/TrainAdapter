@@ -10,6 +10,104 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
+GRID_DIVISIONS = 10.0
+
+
+def flatten_grid_points(grid_points):
+    """将任意层级的 grid_points 拍平成 [[x, y], ...]。"""
+    flattened = []
+
+    def visit(node):
+        if not isinstance(node, list):
+            return
+        if len(node) == 2 and all(isinstance(v, (int, float)) for v in node):
+            flattened.append([float(node[0]), float(node[1])])
+            return
+        for child in node:
+            visit(child)
+
+    visit(grid_points)
+    return flattened
+
+
+def normalize_grid_points(grid_points, grid_divisions=GRID_DIVISIONS):
+    """将 0..grid_divisions 的网格坐标转换为 0..1 的归一化坐标。"""
+    normalized = []
+    for x, y in flatten_grid_points(grid_points):
+        normalized.append([float(x) / float(grid_divisions), float(y) / float(grid_divisions)])
+    return normalized
+
+
+def sample_farthest_points(points, max_points):
+    """
+    用 farthest point sampling 从区域点中选出代表点。
+    第一个点取离几何中心最近的点，后续点依次取离已选集合最远的点。
+    """
+    if max_points <= 0 or not points:
+        return []
+
+    unique_points = []
+    seen = set()
+    for x, y in points:
+        key = (round(float(x), 6), round(float(y), 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_points.append([float(x), float(y)])
+
+    if len(unique_points) <= max_points:
+        return unique_points
+
+    points_array = np.asarray(unique_points, dtype=np.float32)
+    centroid = points_array.mean(axis=0, keepdims=True)
+    first_idx = int(np.argmin(np.linalg.norm(points_array - centroid, axis=1)))
+
+    selected_indices = [first_idx]
+    remaining_indices = set(range(len(unique_points))) - {first_idx}
+
+    while remaining_indices and len(selected_indices) < max_points:
+        remaining_list = sorted(remaining_indices)
+        remaining_points = points_array[remaining_list]
+        selected_points = points_array[selected_indices]
+        # 为了覆盖区域，每轮选离当前已选集合最远的点。
+        min_distances = np.linalg.norm(
+            remaining_points[:, None, :] - selected_points[None, :, :],
+            axis=-1
+        ).min(axis=1)
+        next_pos = int(np.argmax(min_distances))
+        next_idx = remaining_list[next_pos]
+        selected_indices.append(next_idx)
+        remaining_indices.remove(next_idx)
+
+    return [unique_points[idx] for idx in selected_indices]
+
+
+class SimpleTokenizer:
+    """当本地没有可用 tokenizer 时的轻量级回退实现。"""
+    def __init__(self, pad_token_id=0, unk_token_id=1, vocab_size=2048):
+        self.pad_token_id = pad_token_id
+        self.unk_token_id = unk_token_id
+        self.vocab_size = vocab_size
+
+    def __call__(self, text, padding='max_length', truncation=True, max_length=512, return_tensors='pt'):
+        tokens = text.split()
+        token_ids = [self._token_to_id(tok) for tok in tokens][:max_length]
+        attention_mask = [1] * len(token_ids)
+
+        if padding == 'max_length' and len(token_ids) < max_length:
+            pad_len = max_length - len(token_ids)
+            token_ids.extend([self.pad_token_id] * pad_len)
+            attention_mask.extend([0] * pad_len)
+
+        return {
+            'input_ids': torch.tensor([token_ids], dtype=torch.long),
+            'attention_mask': torch.tensor([attention_mask], dtype=torch.long)
+        }
+
+    def _token_to_id(self, token):
+        return abs(hash(token)) % (self.vocab_size - 2) + 2
+
+
 def collate_fn_pad_batch(batch):
     """
     自定义collate_fn: 处理不同尺寸的图像，将batch中所有图像在右下角padding至当前batch最大宽高。
@@ -73,7 +171,10 @@ class CoordinateDataset(Dataset):
                  tokenizer_path='/root/autodl-tmp/Qwen2.5-VL-7B-Instruct',
                  image_size=(448, 448),
                  max_length=512,
-                 transform=None):
+                 transform=None,
+                 num_output_points=4,
+                 target_point_strategy='fps',
+                 target_coordinate_mode='normalized_grid'):
         """
         Args:
             data_root: 数据根目录
@@ -91,12 +192,12 @@ class CoordinateDataset(Dataset):
         self.image_size = image_size
         self.max_length = max_length
         self.transform = transform
+        self.num_output_points = num_output_points
+        self.target_point_strategy = target_point_strategy
+        self.target_coordinate_mode = target_coordinate_mode
         
         # 加载分词器
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path,
-            trust_remote_code=True
-        )
+        self.tokenizer = self._load_tokenizer(tokenizer_path)
         
         # 加载标注数据
         annotation_path = os.path.join(data_root, annotation_file)
@@ -107,6 +208,18 @@ class CoordinateDataset(Dataset):
         self.samples = self._preprocess_annotations()
         
         print(f"Loaded {len(self.samples)} samples from {annotation_path}")
+
+    def _load_tokenizer(self, tokenizer_path):
+        try:
+            return AutoTokenizer.from_pretrained(
+                tokenizer_path,
+                trust_remote_code=True,
+                local_files_only=True
+            )
+        except Exception as e:
+            print(f"Warning: failed to load tokenizer from {tokenizer_path}: {e}")
+            print("Falling back to SimpleTokenizer for local smoke tests")
+            return SimpleTokenizer()
     
     def _preprocess_annotations(self):
         """
@@ -172,6 +285,23 @@ class CoordinateDataset(Dataset):
         template = random.choice(instruction_templates)
         
         return template
+
+    def _normalize_grid_points(self, grid_points):
+        """
+        将区域网格点转换为训练监督目标。
+        默认输出为归一化后的最多 num_output_points 个代表点。
+        """
+        flattened_points = flatten_grid_points(grid_points)
+        if self.target_coordinate_mode == 'normalized_grid':
+            converted_points = normalize_grid_points(flattened_points)
+        else:
+            converted_points = flattened_points
+
+        if self.target_point_strategy == 'fps':
+            return sample_farthest_points(converted_points, self.num_output_points)
+        if self.target_point_strategy == 'all':
+            return converted_points[:self.num_output_points]
+        raise ValueError(f"Unknown target point strategy: {self.target_point_strategy}")
     
     def _load_image(self, image_path):
         """
@@ -251,10 +381,11 @@ class CoordinateDataset(Dataset):
             'grid_image': grid_image,
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'gt_points': sample['grid_points'],
+            'gt_points': self._normalize_grid_points(sample['grid_points']),
             'image_size': (image_width, image_height),
             'query': sample['query'],
-            'instruction': instruction
+            'instruction': instruction,
+            'target_coordinate_mode': self.target_coordinate_mode
         }
         
         return data
@@ -273,6 +404,9 @@ class CoordinateDatasetV2(Dataset):
                  image_size=(448, 448),
                  max_length=512,
                  transform=None,
+                 num_output_points=4,
+                 target_point_strategy='fps',
+                 target_coordinate_mode='normalized_grid',
                  use_negative_samples=True,
                  negative_sample_ratio=0.2):
         """
@@ -286,14 +420,14 @@ class CoordinateDatasetV2(Dataset):
         self.image_size = image_size
         self.max_length = max_length
         self.transform = transform
+        self.num_output_points = num_output_points
+        self.target_point_strategy = target_point_strategy
+        self.target_coordinate_mode = target_coordinate_mode
         self.use_negative_samples = use_negative_samples
         self.negative_sample_ratio = negative_sample_ratio
         
         # 加载分词器
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path,
-            trust_remote_code=True
-        )
+        self.tokenizer = CoordinateDataset._load_tokenizer(self, tokenizer_path)
         
         # 加载标注数据
         annotation_path = os.path.join(data_root, annotation_file)
@@ -367,7 +501,7 @@ class CoordinateDatasetV2(Dataset):
     def _build_instruction(self, query, has_target=True):
         """构建文本指令"""
         if has_target:
-            return super()._build_instruction(query)
+            return CoordinateDataset._build_instruction(self, query)
         else:
             # 负样本指令
             return f"在图像中定位'{query}'，如果不存在则回答'未找到'。"
@@ -378,13 +512,13 @@ class CoordinateDatasetV2(Dataset):
         
         # 1. 加载原始图像
         image_path = os.path.join(self.data_root, self.image_dir, sample['image_id'])
-        image = self._load_image(image_path)
+        image = CoordinateDataset._load_image(self, image_path)
         
         # 2. 加载网格图像
         grid_image_path = os.path.join(self.data_root, self.grid_image_dir, 
                                        os.path.basename(sample['grid_image_path']))
         if os.path.exists(grid_image_path):
-            grid_image = self._load_image(grid_image_path)
+            grid_image = CoordinateDataset._load_image(self, grid_image_path)
         else:
             grid_image = image.clone()
         
@@ -413,11 +547,12 @@ class CoordinateDatasetV2(Dataset):
             'grid_image': grid_image,
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'gt_points': sample['grid_points'],
+            'gt_points': CoordinateDataset._normalize_grid_points(self, sample['grid_points']),
             'image_size': (image_width, image_height),
             'query': sample['query'],
             'instruction': instruction,
-            'has_target': sample['has_target']
+            'has_target': sample['has_target'],
+            'target_coordinate_mode': self.target_coordinate_mode
         }
         
         return data

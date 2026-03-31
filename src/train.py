@@ -6,9 +6,11 @@ import sys
 import argparse
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from PIL import Image
 
 # 添加src到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +21,33 @@ from loss.hungarian_loss import HungarianPointLoss
 from training.trainer import CoordinateAdapterTrainer, create_optimizer_and_scheduler
 from training.config import get_config, CONFIG_PRESETS
 from utils.coordinate_parser import CoordinateParser
+
+
+class FrozenBackbone(nn.Module):
+    """
+    统一的冻结特征抽取器接口。
+    如果本地没有Qwen权重，则退化为轻量级mock backbone，方便先把训练链路跑通。
+    """
+    def __init__(self, hidden_size=768, vocab_size=32768):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.vision_proj = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=4, padding=3),
+            nn.GELU(),
+            nn.Conv2d(64, hidden_size, kernel_size=3, stride=2, padding=1),
+            nn.GELU()
+        )
+        self.text_embedding = nn.Embedding(vocab_size, hidden_size)
+
+    def encode_image(self, images):
+        features = self.vision_proj(images)
+        return features.flatten(2).transpose(1, 2)
+
+    def encode_text(self, input_ids, attention_mask):
+        embeddings = self.text_embedding(input_ids)
+        if attention_mask is None:
+            return embeddings
+        return embeddings * attention_mask.unsqueeze(-1)
 
 
 def setup_transforms(config):
@@ -82,58 +111,89 @@ def load_qwen_model(model_path, device):
     # 加载模型（简化版本，实际使用时需要完整加载）
     # 注意：这里需要根据Qwen2.5-VL的实际结构进行调整
     try:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"model path does not exist: {model_path}")
+
+        target_dtype = torch.float16
+        if getattr(device, 'type', str(device)) == 'cpu':
+            target_dtype = torch.float32
+
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
-            device_map=device
+            torch_dtype=target_dtype,
+            device_map=None,
+            local_files_only=True
         )
         
         processor = AutoProcessor.from_pretrained(model_path)
-        # 为模型挂载tokenizer引用，以便trainer可以直接调用
-        model.tokenizer = processor.tokenizer
-        
+
+        class QwenBackboneWrapper(nn.Module):
+            def __init__(self, qwen_model, qwen_processor):
+                super().__init__()
+                self.qwen_model = qwen_model
+                self.qwen_processor = qwen_processor
+                self.visual_dim = qwen_model.config.hidden_size
+                self.text_dim = qwen_model.config.hidden_size
+                self.merge_size = getattr(qwen_processor.image_processor, 'merge_size', 1)
+
+            def encode_image(self, images):
+                if hasattr(self.qwen_model, 'visual'):
+                    pil_images = [self._tensor_to_pil(image) for image in images]
+                    image_inputs = self.qwen_processor.image_processor(
+                        pil_images,
+                        return_tensors='pt'
+                    )
+                    pixel_values = image_inputs['pixel_values'].to(self.qwen_model.device)
+                    image_grid_thw = image_inputs['image_grid_thw'].to(self.qwen_model.device)
+                    outputs = self.qwen_model.visual(pixel_values, image_grid_thw)
+                    return self._pack_visual_outputs(outputs, image_grid_thw)
+                raise AttributeError("Qwen model does not expose a supported visual encoder")
+
+            def encode_text(self, input_ids, attention_mask):
+                if hasattr(self.qwen_model, 'model') and hasattr(self.qwen_model.model, 'embed_tokens'):
+                    return self.qwen_model.model.embed_tokens(input_ids)
+                if hasattr(self.qwen_model, 'get_input_embeddings'):
+                    return self.qwen_model.get_input_embeddings()(input_ids)
+                raise AttributeError("Qwen model does not expose a supported text embedding layer")
+
+            def _tensor_to_pil(self, image_tensor):
+                image = image_tensor.detach().float().cpu()
+
+                # 尝试反归一化回接近原始 RGB，兼容当前数据增强配置
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                image = image * std + mean
+                image = image.clamp(0, 1)
+
+                image = (image.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+                return Image.fromarray(image)
+
+            def _pack_visual_outputs(self, outputs, image_grid_thw):
+                token_counts = (
+                    image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
+                ) // (self.merge_size ** 2)
+                token_counts = token_counts.tolist()
+
+                chunks = []
+                start = 0
+                for count in token_counts:
+                    end = start + count
+                    chunks.append(outputs[start:end])
+                    start = end
+
+                max_tokens = max(token_counts)
+                padded = outputs.new_zeros((len(chunks), max_tokens, outputs.shape[-1]))
+                for idx, chunk in enumerate(chunks):
+                    padded[idx, :chunk.shape[0]] = chunk
+                return padded
+
         print("Qwen2.5-VL loaded successfully")
-        return model, processor.tokenizer
+        return QwenBackboneWrapper(model, processor).to(device), processor.tokenizer
         
     except Exception as e:
         print(f"Warning: Failed to load Qwen2.5-VL: {e}")
-        print("Creating mock model for testing")
-        
-        # 创建模拟模型（用于测试）
-        class MockQwenModel:
-            def __init__(self):
-                self.device = device
-                self.dtype = torch.float32
-            
-            def to(self, device):
-                self.device = device
-                return self
-            
-            def eval(self):
-                pass
-            
-            def vision_encoder(self, images):
-                # 模拟视觉编码器
-                B = images.shape[0]
-                return torch.randn(B, 196, 768).to(self.device)
-            
-            def text_encoder(self, input_ids, attention_mask):
-                # 模拟文本编码器
-                B = input_ids.shape[0]
-                return torch.randn(B, 50, 768).to(self.device)
-            
-            def generate(self, **kwargs):
-                # 模拟生成
-                inputs_embeds = kwargs.get('inputs_embeds')
-                B = inputs_embeds.shape[0]
-                # 生成模拟文本（包含坐标）
-                return torch.randint(0, 1000, (B, 20)).to(self.device)
-            
-            def get_tokenizer(self):
-                from transformers import AutoTokenizer
-                return AutoTokenizer.from_pretrained('gpt2')
-        
-        return MockQwenModel(), None
+        print("Creating lightweight frozen backbone for smoke tests")
+        return FrozenBackbone().to(device), None
 
 
 def create_adapter(config):
@@ -153,6 +213,7 @@ def create_adapter(config):
             hidden_dim=config.model.hidden_dim,
             num_heads=config.model.num_heads,
             num_grid_tokens=config.model.num_grid_tokens,
+            num_output_points=config.model.num_output_points,
             dropout=config.model.dropout
         )
     else:
@@ -162,6 +223,7 @@ def create_adapter(config):
             hidden_dim=config.model.hidden_dim,
             num_heads=config.model.num_heads,
             num_grid_tokens=config.model.num_grid_tokens,
+            num_output_points=config.model.num_output_points,
             dropout=config.model.dropout
         )
     
@@ -189,7 +251,10 @@ def create_dataloaders(config, train_transform, val_transform):
         tokenizer_path=config.model.qwen_model_path,
         image_size=config.data.image_size,
         max_length=config.data.max_length,
-        transform=train_transform
+        transform=train_transform,
+        num_output_points=config.model.num_output_points,
+        target_point_strategy=config.data.target_point_strategy,
+        target_coordinate_mode=config.data.target_coordinate_mode
     )
     
     # 验证数据集（如果有验证集）
@@ -205,7 +270,10 @@ def create_dataloaders(config, train_transform, val_transform):
             tokenizer_path=config.model.qwen_model_path,
             image_size=config.data.image_size,
             max_length=config.data.max_length,
-            transform=val_transform
+            transform=val_transform,
+            num_output_points=config.model.num_output_points,
+            target_point_strategy=config.data.target_point_strategy,
+            target_coordinate_mode=config.data.target_coordinate_mode
         )
         
         val_dataloader = DataLoader(
@@ -239,7 +307,7 @@ def main():
     parser.add_argument('--config', type=str, default=None, help='配置文件路径')
     parser.add_argument('--preset', type=str, default='default', 
                        choices=list(CONFIG_PRESETS.keys()), help='预置配置')
-    parser.add_argument('--save_dir', type=str, default='/root/autodl-tmp/Data/train_outputs', help='保存目录')
+    parser.add_argument('--save_dir', type=str, default=None, help='保存目录')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
     parser.add_argument('--resume', type=str, default=None, help='从检查点恢复')
     
@@ -249,6 +317,7 @@ def main():
     parser.add_argument('--hidden_dim', type=int, help='隐藏层维度')
     parser.add_argument('--num_heads', type=int, help='注意力头数')
     parser.add_argument('--num_grid_tokens', type=int, help='网格token数量')
+    parser.add_argument('--num_output_points', type=int, help='每张图预测的坐标点数量')
     parser.add_argument('--dropout', type=float, help='Dropout率')
     
     # 数据参数
@@ -274,10 +343,27 @@ def main():
         print(f"Using {args.preset} preset")
     
     # 从命令行参数更新配置
-    config.update_from_args(vars(args))
+    arg_updates = {
+        'model.adapter_type': args.adapter_type,
+        'model.grid_feature_dim': args.grid_feature_dim,
+        'model.hidden_dim': args.hidden_dim,
+        'model.num_heads': args.num_heads,
+        'model.num_grid_tokens': args.num_grid_tokens,
+        'model.num_output_points': args.num_output_points,
+        'model.dropout': args.dropout,
+        'data.data_root': args.data_root,
+        'data.annotation_file': args.annotation_file,
+        'training.batch_size': args.batch_size,
+        'training.lr': args.lr,
+        'training.weight_decay': args.weight_decay,
+        'training.num_epochs': args.num_epochs,
+        'training.gradient_accumulation_steps': args.gradient_accumulation_steps
+    }
+    config.update_from_args(arg_updates)
     
     # 设置保存目录
-    config.logging.save_dir = args.save_dir
+    if args.save_dir:
+        config.logging.save_dir = args.save_dir
     
     # 设置设备
     if args.device:
@@ -297,6 +383,8 @@ def main():
     print(f"Batch size: {config.training.batch_size}")
     print(f"Learning rate: {config.training.lr}")
     print(f"Num epochs: {config.training.num_epochs}")
+    print(f"Target strategy: {config.data.target_point_strategy}")
+    print(f"Coordinate mode: {config.data.target_coordinate_mode}")
     print(f"Save dir: {config.logging.save_dir}")
     print(f"Device: {config.device}")
     print("=" * 50)
@@ -314,7 +402,9 @@ def main():
     
     # 加载Qwen2.5-VL模型
     qwen_model, tokenizer = load_qwen_model(config.model.qwen_model_path, device)
-    
+    if hasattr(qwen_model, 'visual_dim'):
+        config.model.visual_dim = qwen_model.visual_dim
+
     # 创建Coordinate Adapter
     adapter = create_adapter(config)
     adapter.to(device)
@@ -343,11 +433,12 @@ def main():
     
     # 创建优化器和调度器
     total_steps = len(train_dataloader) * config.training.num_epochs
-    config.training.total_steps = total_steps
-    
+    train_config_dict = dict(config.training.__dict__)
+    train_config_dict['total_steps'] = total_steps
+
     optimizer, scheduler = create_optimizer_and_scheduler(
         adapter, 
-        config.training.__dict__
+        train_config_dict
     )
     
     # 创建训练器

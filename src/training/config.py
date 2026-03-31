@@ -7,6 +7,25 @@ from typing import Optional, Dict, Any
 import json
 
 
+def _project_root():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+
+def _default_data_root():
+    return os.environ.get('TRAIN_ADAPTER_DATA_ROOT', os.path.join(_project_root(), 'Data'))
+
+
+def _default_model_path():
+    return os.environ.get(
+        'TRAIN_ADAPTER_QWEN_PATH',
+        os.path.join(_project_root(), 'Qwen2.5-VL-7B-Instruct')
+    )
+
+
+def _default_save_dir():
+    return os.environ.get('TRAIN_ADAPTER_SAVE_DIR', os.path.join(_default_data_root(), 'train_outputs'))
+
+
 @dataclass
 class ModelConfig:
     """模型配置"""
@@ -20,14 +39,15 @@ class ModelConfig:
     dropout: float = 0.1
     
     # Qwen2.5-VL配置
-    qwen_model_path: str = '/root/autodl-tmp/Qwen2.5-VL-7B-Instruct'
+    qwen_model_path: str = field(default_factory=_default_model_path)
     freeze_qwen: bool = True
+    num_output_points: int = 4
 
 
 @dataclass
 class DataConfig:
     """数据配置"""
-    data_root: str = '/root/autodl-tmp/Data'
+    data_root: str = field(default_factory=_default_data_root)
     annotation_file: str = 'grefs_with_grids.json'
     image_dir: str = 'images'
     grid_image_dir: str = 'grid_images'
@@ -39,9 +59,13 @@ class DataConfig:
     color_jitter: bool = True
     random_resized_crop: bool = True
     horizontal_flip: bool = False  # 坐标会变化，慎用
+
+    # 监督目标
+    target_point_strategy: str = 'fps'
+    target_coordinate_mode: str = 'normalized_grid'
     
     # 负样本
-    use_negative_samples: bool = True
+    use_negative_samples: bool = False
     negative_sample_ratio: float = 0.2
 
 
@@ -49,20 +73,20 @@ class DataConfig:
 class TrainingConfig:
     """训练配置"""
     # 优化器
-    lr: float = 1e-4
+    lr: float = 5e-5
     weight_decay: float = 0.01
     betas: tuple = (0.9, 0.999)
     
     # 训练参数
     batch_size: int = 8
-    num_epochs: int = 15
+    num_epochs: int = 12
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     
     # 学习率调度
     use_scheduler: bool = True
-    warmup_steps: int = 500
-    warmup_ratio: float = 0.1
+    warmup_steps: int = 200
+    warmup_ratio: float = 0.05
     scheduler_type: str = 'cosine'  # 'cosine' or 'linear'
     
     # Loss配置
@@ -78,7 +102,7 @@ class LoggingConfig:
     log_interval: int = 10
     eval_interval: int = 500
     save_interval: int = 1000
-    save_dir: str = '/root/autodl-tmp/Data/train_outputs'
+    save_dir: str = field(default_factory=_default_save_dir)
     
     # WandB配置（可选）
     use_wandb: bool = False
@@ -182,7 +206,7 @@ def get_lightweight_config():
     
     # 训练配置
     config.training.batch_size = 16  # 更大的batch size
-    config.training.lr = 2e-4
+    config.training.lr = 1e-4
     config.training.gradient_accumulation_steps = 2
     
     return config
@@ -201,14 +225,14 @@ def get_high_performance_config():
     
     # 数据配置
     config.data.use_data_augmentation = True
-    config.data.use_negative_samples = True
+    config.data.use_negative_samples = False
     config.data.negative_sample_ratio = 0.3
     
     # 训练配置
     config.training.batch_size = 8
-    config.training.num_epochs = 20
-    config.training.lr = 1e-4
-    config.training.warmup_steps = 1000
+    config.training.num_epochs = 16
+    config.training.lr = 5e-5
+    config.training.warmup_steps = 400
     
     return config
 

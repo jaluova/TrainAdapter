@@ -20,11 +20,13 @@ class CoordinateAdapter(nn.Module):
                  hidden_dim=512,
                  num_heads=8,
                  num_grid_tokens=64,
+                 num_output_points=4,
                  dropout=0.1):
         super(CoordinateAdapter, self).__init__()
         
         self.visual_dim = visual_dim
         self.hidden_dim = hidden_dim
+        self.num_output_points = num_output_points
         
         # 1. Grid Encoder: 从网格图像提取特征
         self.grid_encoder = GridEncoder(
@@ -57,6 +59,14 @@ class CoordinateAdapter(nn.Module):
             dim=visual_dim,
             hidden_dim=hidden_dim * 4,
             dropout=dropout
+        )
+
+        # 6. Point head: 从融合后的视觉特征和文本特征中直接预测坐标
+        self.point_head = nn.Sequential(
+            nn.Linear(visual_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_output_points * 3)
         )
         
         # 初始化权重
@@ -111,6 +121,33 @@ class CoordinateAdapter(nn.Module):
         final_features = self.residual_ffn(fused_features)
         
         return final_features
+
+    def predict_points(self, visual_features, text_features=None):
+        """
+        基于增强后的视觉特征预测坐标点和置信度
+
+        Args:
+            visual_features: [B, N, D]
+            text_features: [B, L, D] or None
+
+        Returns:
+            pred_points: [B, K, 2]，归一化到[0, 1]
+            pred_logits: [B, K]
+        """
+        visual_summary = visual_features.mean(dim=1)
+
+        if text_features is None:
+            text_summary = torch.zeros_like(visual_summary)
+        else:
+            text_summary = text_features.mean(dim=1)
+
+        fused_summary = torch.cat([visual_summary, text_summary], dim=-1)
+        raw_outputs = self.point_head(fused_summary)
+        raw_outputs = raw_outputs.view(-1, self.num_output_points, 3)
+
+        pred_points = torch.sigmoid(raw_outputs[..., :2])
+        pred_logits = raw_outputs[..., 2]
+        return pred_points, pred_logits
     
     def get_trainable_parameters(self):
         """
@@ -140,11 +177,13 @@ class LightweightCoordinateAdapter(nn.Module):
                  hidden_dim=256,
                  num_heads=4,
                  num_grid_tokens=32,
+                 num_output_points=4,
                  dropout=0.1):
         super(LightweightCoordinateAdapter, self).__init__()
         
         self.visual_dim = visual_dim
         self.hidden_dim = hidden_dim
+        self.num_output_points = num_output_points
         
         # 1. 轻量级Grid Encoder
         self.grid_encoder = GridEncoder(
@@ -178,6 +217,13 @@ class LightweightCoordinateAdapter(nn.Module):
             hidden_dim=hidden_dim * 2,  # 减小隐藏层维度
             dropout=dropout
         )
+
+        self.point_head = nn.Sequential(
+            nn.Linear(visual_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_output_points * 3)
+        )
         
     def forward(self, images, grid_images, visual_features):
         """前向传播（同CoordinateAdapter）"""
@@ -187,6 +233,33 @@ class LightweightCoordinateAdapter(nn.Module):
         fused_features = self.gated_fusion(visual_features, enhanced_features)
         final_features = self.residual_ffn(fused_features)
         return final_features
+
+    def predict_points(self, visual_features, text_features=None):
+        visual_summary = visual_features.mean(dim=1)
+
+        if text_features is None:
+            text_summary = torch.zeros_like(visual_summary)
+        else:
+            text_summary = text_features.mean(dim=1)
+
+        fused_summary = torch.cat([visual_summary, text_summary], dim=-1)
+        raw_outputs = self.point_head(fused_summary)
+        raw_outputs = raw_outputs.view(-1, self.num_output_points, 3)
+
+        pred_points = torch.sigmoid(raw_outputs[..., :2])
+        pred_logits = raw_outputs[..., 2]
+        return pred_points, pred_logits
+
+    def get_trainable_parameters(self):
+        return list(self.parameters())
+
+    def get_parameter_count(self):
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {
+            'total': total_params,
+            'trainable': trainable_params
+        }
 
 
 if __name__ == "__main__":

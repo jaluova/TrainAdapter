@@ -3,6 +3,7 @@ Cross-Attention Module: 网格特征指导视觉特征增强
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 
@@ -172,8 +173,6 @@ class ResidualFFN(nn.Module):
 
 
 if __name__ == "__main__":
-    import torch.nn.functional as F
-    
     # 测试代码
     B, N, M, D = 2, 196, 64, 768
     

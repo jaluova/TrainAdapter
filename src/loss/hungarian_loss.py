@@ -6,7 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from scipy.optimize import linear_sum_assignment
+try:
+    from scipy.optimize import linear_sum_assignment
+except Exception:
+    linear_sum_assignment = None
 
 
 class HungarianPointLoss(nn.Module):
@@ -168,7 +171,6 @@ class HungarianPointLoss(nn.Module):
         
         # 添加边界惩罚到每个预测点
         for i in range(num_pred):
-            print(f"num_pred: {num_pred}, distances.shape: {distances.shape}")
             boundary_penalty = self.compute_boundary_penalty([pred_points[i]], image_width, image_height)
             distances[i, :] += self.boundary_penalty_weight * boundary_penalty
         
@@ -187,16 +189,112 @@ class HungarianPointLoss(nn.Module):
         """
         if cost_matrix.numel() == 0:
             return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
-        
-        # 转换为numpy数组
-        cost_matrix_np = cost_matrix.cpu().numpy()
-        
-        # Hungarian算法
+
+        if linear_sum_assignment is None:
+            return self.greedy_matching(cost_matrix)
+
+        cost_matrix_np = cost_matrix.detach().cpu().numpy()
         row_indices, col_indices = linear_sum_assignment(cost_matrix_np)
-        
         return row_indices, col_indices
-    
-    def forward(self, pred_texts, gt_points_list, image_sizes):
+
+    def greedy_matching(self, cost_matrix):
+        if cost_matrix.numel() == 0:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+
+        num_pred, num_gt = cost_matrix.shape
+        used_pred = set()
+        matched_pred = []
+        matched_gt = []
+
+        for gt_idx in range(num_gt):
+            best_pred = None
+            best_cost = None
+            for pred_idx in range(num_pred):
+                if pred_idx in used_pred:
+                    continue
+                cost = cost_matrix[pred_idx, gt_idx].item()
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_pred = pred_idx
+
+            if best_pred is not None:
+                used_pred.add(best_pred)
+                matched_pred.append(best_pred)
+                matched_gt.append(gt_idx)
+
+        return np.array(matched_pred, dtype=np.int64), np.array(matched_gt, dtype=np.int64)
+
+    def _tensor_loss(self, pred_points, gt_points_list, image_sizes, pred_logits=None):
+        batch_size, num_pred, _ = pred_points.shape
+        total_loss = pred_points.new_tensor(0.0)
+        match_info = []
+
+        for i in range(batch_size):
+            image_width, image_height = image_sizes[i]
+            pred_norm = pred_points[i]
+
+            gt_points = gt_points_list[i]
+            if len(gt_points) == 0:
+                target_mask = torch.zeros(num_pred, device=pred_points.device)
+                score_loss = pred_points.new_tensor(0.0)
+                if pred_logits is not None:
+                    score_loss = F.binary_cross_entropy_with_logits(pred_logits[i], target_mask)
+                total_loss = total_loss + score_loss
+                match_info.append({
+                    'pred_points': pred_norm.detach().cpu().tolist(),
+                    'pred_scores': torch.sigmoid(pred_logits[i]).detach().cpu().tolist() if pred_logits is not None else [],
+                    'gt_points': gt_points,
+                    'matched_pred_indices': [],
+                    'matched_gt_indices': [],
+                    'sample_loss': float(score_loss.detach().cpu()),
+                    'coordinate_mode': 'normalized_grid',
+                    'image_size': (image_width, image_height)
+                })
+                continue
+
+            gt_tensor = torch.tensor(gt_points, dtype=pred_points.dtype, device=pred_points.device)
+            cost_matrix = torch.cdist(pred_norm, gt_tensor, p=2)
+            matched_pred_indices, matched_gt_indices = self.hungarian_matching(cost_matrix)
+
+            matched_loss = pred_points.new_tensor(0.0)
+            if len(matched_pred_indices) > 0:
+                pred_idx_tensor = torch.as_tensor(matched_pred_indices, dtype=torch.long, device=pred_points.device)
+                gt_idx_tensor = torch.as_tensor(matched_gt_indices, dtype=torch.long, device=pred_points.device)
+                matched_loss = cost_matrix[pred_idx_tensor, gt_idx_tensor].mean()
+
+            target_mask = torch.zeros(num_pred, device=pred_points.device)
+            if len(matched_pred_indices) > 0:
+                target_mask[torch.as_tensor(matched_pred_indices, dtype=torch.long, device=pred_points.device)] = 1.0
+
+            score_loss = pred_points.new_tensor(0.0)
+            if pred_logits is not None:
+                score_loss = F.binary_cross_entropy_with_logits(pred_logits[i], target_mask)
+
+            unmatched_gt_loss = pred_points.new_tensor(0.0)
+            if len(gt_points) > len(matched_gt_indices):
+                unmatched_gt_indices = sorted(set(range(len(gt_points))) - set(matched_gt_indices))
+                if unmatched_gt_indices:
+                    remaining_gt = gt_tensor[torch.as_tensor(unmatched_gt_indices, dtype=torch.long, device=pred_points.device)]
+                    unmatched_gt_loss = torch.cdist(pred_norm, remaining_gt, p=2).min(dim=0).values.mean()
+
+            sample_loss = matched_loss + 0.2 * unmatched_gt_loss + 0.1 * score_loss
+            total_loss = total_loss + sample_loss
+
+            match_info.append({
+                'pred_points': pred_norm.detach().cpu().tolist(),
+                'pred_scores': torch.sigmoid(pred_logits[i]).detach().cpu().tolist() if pred_logits is not None else [],
+                'gt_points': gt_points,
+                'matched_pred_indices': matched_pred_indices.tolist(),
+                'matched_gt_indices': matched_gt_indices.tolist(),
+                'sample_loss': float(sample_loss.detach().cpu()),
+                'coordinate_mode': 'normalized_grid',
+                'image_size': (image_width, image_height)
+            })
+
+        avg_loss = total_loss / max(batch_size, 1)
+        return avg_loss, match_info
+
+    def _text_loss(self, pred_texts, gt_points_list, image_sizes):
         """
         前向传播，计算Hungarian Loss
         
@@ -296,8 +394,12 @@ class HungarianPointLoss(nn.Module):
         
         # 平均损失
         avg_loss = total_loss / batch_size
-        
         return avg_loss, match_info
+
+    def forward(self, pred_texts=None, gt_points_list=None, image_sizes=None, pred_points=None, pred_logits=None):
+        if pred_points is not None:
+            return self._tensor_loss(pred_points, gt_points_list, image_sizes, pred_logits)
+        return self._text_loss(pred_texts, gt_points_list, image_sizes)
 
 
 class HungarianPointLossPyTorch(nn.Module):

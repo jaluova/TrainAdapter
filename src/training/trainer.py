@@ -4,6 +4,7 @@
 import os
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
@@ -11,6 +12,7 @@ from tqdm import tqdm
 import json
 import logging
 from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
 
 
 class CoordinateAdapterTrainer:
@@ -80,6 +82,9 @@ class CoordinateAdapterTrainer:
         self.global_step = 0
         self.epoch = 0
         self.best_loss = float('inf')
+        self.best_acc_5 = -1.0
+        self.qualitative_top_k = min(4, getattr(self.adapter, 'num_output_points', 4))
+        self.qualitative_panel_indices = self._select_qualitative_indices()
         
         # 冻结Qwen模型
         self._freeze_qwen_model()
@@ -105,8 +110,9 @@ class CoordinateAdapterTrainer:
     
     def _freeze_qwen_model(self):
         """冻结Qwen2.5-VL模型参数"""
-        for param in self.qwen_model.parameters():
-            param.requires_grad = False
+        if hasattr(self.qwen_model, 'parameters'):
+            for param in self.qwen_model.parameters():
+                param.requires_grad = False
         
         self.qwen_model.eval()
         self.logger.info("Qwen2.5-VL model frozen and set to eval mode")
@@ -120,7 +126,8 @@ class CoordinateAdapterTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'loss': loss,
-            'best_loss': self.best_loss
+            'best_loss': self.best_loss,
+            'best_acc_5': self.best_acc_5
         }
         
         # 保存最新检查点
@@ -148,19 +155,174 @@ class CoordinateAdapterTrainer:
         self.global_step = checkpoint['step']
         self.epoch = checkpoint['epoch']
         self.best_loss = checkpoint['best_loss']
+        self.best_acc_5 = checkpoint.get('best_acc_5', self.best_acc_5)
         
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
+
+    def _select_qualitative_indices(self, count=6):
+        """固定一组验证样本，避免每次评估都换图。"""
+        if self.val_dataloader is None or not hasattr(self.val_dataloader, 'dataset'):
+            return []
+
+        dataset = self.val_dataloader.dataset
+        if len(dataset) == 0:
+            return []
+
+        count = min(count, len(dataset))
+        if count == len(dataset):
+            return list(range(len(dataset)))
+        if count == 1:
+            return [0]
+
+        step = (len(dataset) - 1) / float(count - 1)
+        return sorted({round(i * step) for i in range(count)})
+
+    def _load_font(self, size, bold=False):
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except OSError:
+                    pass
+        return ImageFont.load_default()
+
+    def _rank_predictions(self, pred_points, pred_scores, top_k=None):
+        top_k = self.qualitative_top_k if top_k is None else top_k
+        top_k = max(1, min(top_k, len(pred_points)))
+        scored = list(zip(pred_points, pred_scores))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored[:top_k]
+
+    def _normalized_points_to_grid_pixels(self, points, image_size, border_size=28):
+        width, height = image_size
+        pixel_points = []
+        for point in points:
+            x = border_size + float(point[0]) * width
+            y = border_size + float(point[1]) * height
+            pixel_points.append((x, y))
+        return pixel_points
+
+    def _draw_point(self, draw, point, color, label, radius=8, fill=True):
+        x, y = point
+        bbox = [x - radius, y - radius, x + radius, y + radius]
+        if fill:
+            draw.ellipse(bbox, fill=color, outline="white", width=2)
+        else:
+            draw.ellipse(bbox, outline=color, width=3)
+        font = self._load_font(18, bold=True)
+        draw.text((x + radius + 3, y - radius - 3), label, fill=color, font=font)
+
+    def _save_qualitative_panel(self, step):
+        if self.val_dataloader is None or not self.qualitative_panel_indices:
+            return None
+
+        from data.dataset import collate_fn_pad_batch
+
+        dataset = self.val_dataloader.dataset
+        panel_dir = os.path.join(self.save_dir, 'qualitative_panels', f'step_{step:06d}')
+        os.makedirs(panel_dir, exist_ok=True)
+
+        manifest = {
+            'step': step,
+            'epoch': self.epoch,
+            'indices': self.qualitative_panel_indices,
+            'coordinate_mode': 'normalized_grid',
+            'top_k': self.qualitative_top_k,
+        }
+
+        title_font = self._load_font(26, bold=True)
+        body_font = self._load_font(18)
+        small_font = self._load_font(16)
+
+        with torch.no_grad():
+            for sample_idx in self.qualitative_panel_indices:
+                item = dataset[sample_idx]
+                batch = collate_fn_pad_batch([item])
+                pred_points, pred_logits = self.forward_batch(batch)
+                pred_points = pred_points[0].detach().cpu().tolist()
+                pred_scores = torch.sigmoid(pred_logits[0]).detach().cpu().tolist()
+                ranked = self._rank_predictions(pred_points, pred_scores)
+
+                image_id = dataset.samples[sample_idx]['image_id']
+                image_size = item['image_size']
+                original_path = os.path.join(dataset.data_root, dataset.image_dir, image_id)
+                grid_path = os.path.join(dataset.data_root, dataset.grid_image_dir, os.path.basename(dataset.samples[sample_idx]['grid_image_path']))
+
+                original_img = Image.open(original_path).convert('RGB')
+                if os.path.exists(grid_path):
+                    grid_img = Image.open(grid_path).convert('RGB')
+                else:
+                    grid_img = Image.new('RGB', (original_img.width + 56, original_img.height + 56), 'white')
+                    grid_img.paste(original_img, (28, 28))
+
+                gt_pixel_points = self._normalized_points_to_grid_pixels(item['gt_points'], image_size)
+                pred_pixel_points = self._normalized_points_to_grid_pixels([point for point, _ in ranked], image_size)
+
+                panel_gap = 30
+                header_h = 140
+                footer_h = 130
+                canvas_w = original_img.width + grid_img.width + panel_gap * 3
+                canvas_h = max(original_img.height, grid_img.height) + header_h + footer_h
+                canvas = Image.new('RGB', (canvas_w, canvas_h), '#f5f7fb')
+                draw = ImageDraw.Draw(canvas)
+
+                draw.text((30, 20), "Validation Qualitative Panel", fill="#18212f", font=title_font)
+                draw.text((30, 56), f"Image: {image_id}", fill="#334155", font=body_font)
+                draw.text((30, 84), f"Query: {item['query']}", fill="#1f2937", font=body_font)
+
+                left_x = panel_gap
+                top_y = header_h
+                right_x = left_x + original_img.width + panel_gap
+                canvas.paste(original_img, (left_x, top_y))
+                canvas.paste(grid_img, (right_x, top_y))
+
+                draw.text((left_x, top_y - 28), "Original Image", fill="#1f2937", font=body_font)
+                draw.text((right_x, top_y - 28), "Grid Image + GT / Predictions", fill="#1f2937", font=body_font)
+
+                overlay = ImageDraw.Draw(canvas)
+                for idx, point in enumerate(gt_pixel_points, start=1):
+                    self._draw_point(overlay, (right_x + point[0], top_y + point[1]), "#1d4ed8", f"G{idx}", radius=7, fill=True)
+
+                for idx, ((point_x, point_y), (_, score)) in enumerate(zip(pred_pixel_points, ranked), start=1):
+                    self._draw_point(overlay, (right_x + point_x, top_y + point_y), "#dc2626", f"P{idx}", radius=10, fill=False)
+                    overlay.text((right_x + point_x + 16, top_y + point_y + 10), f"{score:.2f}", fill="#b91c1c", font=small_font)
+
+                footer_y = top_y + max(original_img.height, grid_img.height) + 24
+                draw.rounded_rectangle([30, footer_y, canvas_w - 30, canvas_h - 24], radius=18, fill="white", outline="#d7deea", width=2)
+                draw.text((50, footer_y + 18), "Readout", fill="#162033", font=body_font)
+                draw.text((50, footer_y + 50), "Blue dots are sampled supervision points; red circles are top confidence predictions.", fill="#334155", font=small_font)
+                draw.text((50, footer_y + 74), "Scores come from sigmoid(pred_logits); training and evaluation both operate in normalized grid coordinates.", fill="#334155", font=small_font)
+
+                output_prefix = os.path.join(panel_dir, f"sample_{sample_idx:04d}_{image_id}")
+                canvas.save(f"{output_prefix}.png")
+                with open(f"{output_prefix}.json", 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'image_id': image_id,
+                        'query': item['query'],
+                        'image_size': list(image_size),
+                        'ground_truth_points_normalized': item['gt_points'],
+                        'predicted_points_normalized': [[round(float(x), 4), round(float(y), 4)] for x, y in [point for point, _ in ranked]],
+                        'prediction_scores': [round(float(score), 4) for _, score in ranked],
+                    }, f, ensure_ascii=False, indent=2)
+
+        with open(os.path.join(panel_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        return panel_dir
     
-    def generate_coordinates(self, batch):
+    def forward_batch(self, batch):
         """
-        生成坐标：使用Qwen2.5-VL生成文本，然后解析坐标
+        前向计算：提取冻结特征，经过Adapter预测坐标点
         
         Args:
             batch: 批次数据
             
         Returns:
-            generated_texts: 生成的文本列表
-            pred_points_list: 解析的坐标点列表
+            pred_points: [B, K, 2]
+            pred_logits: [B, K]
         """
         # 提取批次数据
         images = batch['image'].to(self.device)
@@ -169,44 +331,25 @@ class CoordinateAdapterTrainer:
         attention_mask = batch['attention_mask'].to(self.device)
         
         batch_size = images.shape[0]
+        adapter_dtype = next(self.adapter.parameters()).dtype
         
         # 1. 视觉编码（冻结）
         with torch.no_grad():
-            # Qwen2.5-VL视觉编码器，注意Qwen2.5-VL真实网络层是 visual
-            visual_features = self.qwen_model.visual(images)  # [B, N, D]
-            # grid_visual_features = self.qwen_model.visual(grid_images)  # [B, N, D]
+            visual_features = self.qwen_model.encode_image(images)
+            if visual_features.dtype != adapter_dtype:
+                visual_features = visual_features.to(dtype=adapter_dtype)
         
         # 2. Adapter增强（可训练）
         enhanced_features = self.adapter(images, grid_images, visual_features)
         
         # 3. 文本编码（冻结）
         with torch.no_grad():
-            text_embeddings = self.qwen_model.text_encoder(input_ids, attention_mask)
-        
-        # 4. 融合特征
-        # 将文本特征与增强的视觉特征结合
-        fused_features = torch.cat([text_embeddings, enhanced_features], dim=1)
-        
-        # 5. 生成文本（冻结）
-        with torch.no_grad():
-            outputs = self.qwen_model.generate(
-                inputs_embeds=fused_features,
-                attention_mask=attention_mask,
-                max_length=100,
-                do_sample=True,
-                temperature=0.7
-            )
-        
-        # 6. 解码文本
-        generated_texts = []
-        for i in range(batch_size):
-            generated_text = self.qwen_model.tokenizer.decode(
-                outputs[i], 
-                skip_special_tokens=True
-            )
-            generated_texts.append(generated_text)
-        
-        return generated_texts
+            text_embeddings = self.qwen_model.encode_text(input_ids, attention_mask)
+            if text_embeddings.dtype != adapter_dtype:
+                text_embeddings = text_embeddings.to(dtype=adapter_dtype)
+
+        pred_points, pred_logits = self.adapter.predict_points(enhanced_features, text_embeddings)
+        return pred_points, pred_logits
     
     def train_step(self, batch):
         """
@@ -221,8 +364,7 @@ class CoordinateAdapterTrainer:
         # 设置为训练模式
         self.adapter.train()
         
-        # 生成坐标文本
-        generated_texts = self.generate_coordinates(batch)
+        pred_points, pred_logits = self.forward_batch(batch)
         
         # 获取真值数据
         gt_points_list = batch['gt_points']
@@ -230,7 +372,8 @@ class CoordinateAdapterTrainer:
         
         # 计算损失
         loss, match_info = self.loss_fn(
-            pred_texts=generated_texts,
+            pred_points=pred_points,
+            pred_logits=pred_logits,
             gt_points_list=gt_points_list,
             image_sizes=image_sizes
         )
@@ -274,8 +417,7 @@ class CoordinateAdapterTrainer:
         
         with torch.no_grad():
             for batch in tqdm(self.val_dataloader, desc='Evaluating'):
-                # 生成坐标
-                generated_texts = self.generate_coordinates(batch)
+                pred_points, pred_logits = self.forward_batch(batch)
                 
                 # 获取真值数据
                 gt_points_list = batch['gt_points']
@@ -283,7 +425,8 @@ class CoordinateAdapterTrainer:
                 
                 # 计算损失
                 loss, match_info = self.loss_fn(
-                    pred_texts=generated_texts,
+                    pred_points=pred_points,
+                    pred_logits=pred_logits,
                     gt_points_list=gt_points_list,
                     image_sizes=image_sizes
                 )
@@ -296,6 +439,9 @@ class CoordinateAdapterTrainer:
         
         # 计算评估指标
         metrics = self._compute_metrics(all_match_info)
+        panel_dir = self._save_qualitative_panel(self.global_step)
+        if panel_dir:
+            metrics['qualitative_panel_dir'] = panel_dir
         
         return avg_loss, metrics
     
@@ -317,15 +463,17 @@ class CoordinateAdapterTrainer:
         for info in match_info:
             pred_points = info['pred_points']
             gt_points = info['gt_points']
-            image_size = info.get('image_size', (500, 500))
+            pred_scores = info.get('pred_scores', [1.0] * len(pred_points))
             
             if len(pred_points) == 0 or len(gt_points) == 0:
                 continue
+
+            ranked_points = [point for point, _ in self._rank_predictions(pred_points, pred_scores)]
             
             # 计算最近距离
             for gt_point in gt_points:
                 min_dist = float('inf')
-                for pred_point in pred_points:
+                for pred_point in ranked_points:
                     dist = np.linalg.norm(np.array(pred_point) - np.array(gt_point))
                     min_dist = min(min_dist, dist)
                 
@@ -333,10 +481,9 @@ class CoordinateAdapterTrainer:
                 total_samples += 1
                 
                 # 计算准确率
-                max_size = max(image_size)
-                if min_dist < 0.05 * max_size:  # 5%范围内
+                if min_dist < 0.05:
                     acc_5 += 1
-                if min_dist < 0.1 * max_size:   # 10%范围内
+                if min_dist < 0.1:
                     acc_10 += 1
         
         metrics = {
@@ -360,6 +507,7 @@ class CoordinateAdapterTrainer:
             self.load_checkpoint(resume_from)
         
         self.logger.info(f"Start training for {num_epochs} epochs")
+        self.optimizer.zero_grad(set_to_none=True)
         
         for epoch in range(num_epochs):
             self.epoch = epoch
@@ -390,13 +538,19 @@ class CoordinateAdapterTrainer:
                         if val_loss is not None:
                             self.logger.info(
                                 f"Validation - Loss: {val_loss:.4f}, "
-                                f"L1 Error: {metrics['l1_error']:.2f}, "
+                                f"L1 Error: {metrics['l1_error']:.4f}, "
                                 f"Acc@5: {metrics['acc_5']:.2%}, "
                                 f"Acc@10: {metrics['acc_10']:.2%}"
                             )
+                            if metrics.get('qualitative_panel_dir'):
+                                self.logger.info(f"Saved qualitative panel to {metrics['qualitative_panel_dir']}")
                             
                             # 保存最佳模型
-                            if val_loss < self.best_loss:
+                            if (
+                                metrics['acc_5'] > self.best_acc_5 or
+                                (metrics['acc_5'] == self.best_acc_5 and val_loss < self.best_loss)
+                            ):
+                                self.best_acc_5 = metrics['acc_5']
                                 self.best_loss = val_loss
                                 self.save_checkpoint(self.global_step, val_loss, is_best=True)
                     
@@ -405,6 +559,7 @@ class CoordinateAdapterTrainer:
                         self.save_checkpoint(self.global_step, loss)
                 
                 except Exception as e:
+                    self.optimizer.zero_grad(set_to_none=True)
                     self.logger.error(f"Error at step {self.global_step}: {str(e)}")
                     continue
             
@@ -440,15 +595,19 @@ def create_optimizer_and_scheduler(adapter, train_config):
     # 学习率调度器
     scheduler = None
     if train_config.get('use_scheduler', True):
-        warmup_steps = train_config.get('warmup_steps', 500)
+        warmup_steps = train_config.get('warmup_steps', 200)
         total_steps = train_config.get('total_steps', 10000)
+        warmup_ratio = train_config.get('warmup_ratio', 0.05)
+        warmup_steps = max(int(warmup_steps), int(total_steps * warmup_ratio), 1)
         
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / warmup_steps
             else:
-                progress = (step - warmup_steps) / (total_steps - warmup_steps)
-                return 0.5 * (1 + torch.cos(torch.tensor(np.pi * progress)))
+                decay_steps = max(total_steps - warmup_steps, 1)
+                progress = (step - warmup_steps) / decay_steps
+                progress = min(max(progress, 0.0), 1.0)
+                return 0.5 * (1 + np.cos(np.pi * progress))
         
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
