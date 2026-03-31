@@ -154,6 +154,32 @@
         line-height: 1.5;
         word-break: break-word;
       }
+      .coord-list {
+        display: grid;
+        gap: 12px;
+      }
+      .coord-item {
+        padding: 12px 14px;
+        border-radius: 14px;
+        background: #f4f8ef;
+        border: 1px solid var(--line);
+      }
+      .coord-title {
+        font-size: 14px;
+        font-weight: 700;
+        margin-bottom: 6px;
+      }
+      .coord-query {
+        color: var(--muted);
+        font-size: 13px;
+        margin-bottom: 8px;
+      }
+      .coord-meta {
+        font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.6;
+        word-break: break-word;
+      }
       .chart-meta {
         color: var(--muted);
         font-size: 13px;
@@ -247,6 +273,13 @@
             <h2 class="panel-title">Recent Checkpoints</h2>
             <ul id="checkpoints"><li>暂无</li></ul>
           </div>
+          <div class="card" style="margin-top: 16px;">
+            <h2 class="panel-title">Latest Coordinates</h2>
+            <div id="coordsMeta" class="chart-meta">等待 qualitative panel…</div>
+            <div id="coordinates" class="coord-list">
+              <div class="small">暂无坐标数据</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -286,6 +319,39 @@
             <div class="process-command">${command}</div>
           </div>
         `;
+      }
+
+      function formatCoordList(points, scores) {
+        if (!points || !points.length) return "-";
+        return points.map((point, index) => {
+          const x = Number(point[0]).toFixed(3);
+          const y = Number(point[1]).toFixed(3);
+          const score = scores && scores[index] != null ? ` @ ${Number(scores[index]).toFixed(3)}` : "";
+          return `(${x}, ${y})${score}`;
+        }).join(" | ");
+      }
+
+      function renderCoordinates(panel) {
+        const meta = el("coordsMeta");
+        const container = el("coordinates");
+
+        if (!panel || !(panel.samples || []).length) {
+          meta.textContent = "等待 qualitative panel…";
+          container.innerHTML = '<div class="small">暂无坐标数据</div>';
+          return;
+        }
+
+        const step = panel.manifest && panel.manifest.step != null ? panel.manifest.step : "?";
+        meta.textContent = `Latest panel step ${step} · ${panel.samples.length} samples`;
+
+        container.innerHTML = panel.samples.map((sample, index) => `
+          <div class="coord-item">
+            <div class="coord-title">#${index + 1} ${sample.image_id || "-"}</div>
+            <div class="coord-query">${sample.query || "-"}</div>
+            <div class="coord-meta">GT: ${formatCoordList(sample.ground_truth_points_normalized)}</div>
+            <div class="coord-meta">Pred: ${formatCoordList(sample.predicted_points_normalized, sample.prediction_scores)}</div>
+          </div>
+        `).join("");
       }
 
       function renderLineChart(containerId, metaId, seriesList, fallbackText) {
@@ -374,6 +440,7 @@
 
         el("recentLog").textContent = (data.recent_lines || []).join("\n");
         renderProcesses(data.process_summary);
+        renderCoordinates(data.latest_qualitative_panel);
         renderLineChart(
           "lossChart",
           "lossChartMeta",

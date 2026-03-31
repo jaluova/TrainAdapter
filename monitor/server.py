@@ -205,6 +205,36 @@ if checkpoint_dir.exists():
         [path.name for path in checkpoint_dir.glob("checkpoint_step_*.pth")]
     )[-5:]
 
+latest_panel = None
+panel_root = save_dir / "qualitative_panels"
+if panel_root.exists():
+    panel_dirs = sorted([path for path in panel_root.iterdir() if path.is_dir()])
+    if panel_dirs:
+        panel_dir = panel_dirs[-1]
+        panel_jsons = sorted(panel_dir.glob("sample_*.json"))
+        samples = []
+        for sample_path in panel_jsons[:6]:
+            try:
+                sample_payload = json.loads(sample_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            sample_payload["file_name"] = sample_path.name
+            samples.append(sample_payload)
+
+        manifest_path = panel_dir / "manifest.json"
+        manifest = None
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = None
+
+        latest_panel = {
+            "dir": str(panel_dir),
+            "manifest": manifest,
+            "samples": samples,
+        }
+
 payload = {{
     "timestamp": int(float(Path("/proc/uptime").read_text().split()[0])) if Path("/proc/uptime").exists() else None,
     "log_path": str(log_path),
@@ -219,6 +249,7 @@ payload = {{
     "recent_lines": lines[-80:],
     "step_history": step_history[-120:],
     "val_history": val_history[-40:],
+    "latest_qualitative_panel": latest_panel,
 }}
 print(json.dumps(payload, ensure_ascii=False))
 """
