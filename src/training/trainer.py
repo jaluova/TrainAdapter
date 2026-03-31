@@ -2,6 +2,7 @@
 训练器：负责训练Coordinate Adapter
 """
 import os
+import re
 import torch
 import torch.nn as nn
 import numpy as np
@@ -148,8 +149,32 @@ class CoordinateAdapterTrainer:
             best_path = os.path.join(self.save_dir, 'checkpoints', 'best_model.pth')
             torch.save(checkpoint, best_path)
             self.logger.info(f"Saved best model at step {step} with loss {loss:.4f}")
+
+        self._prune_regular_checkpoints(keep_last=3)
         
         self.logger.info(f"Saved checkpoint at step {step}")
+
+    def _prune_regular_checkpoints(self, keep_last=3):
+        """只保留最近 keep_last 个普通 checkpoint，best_model.pth 永远保留。"""
+        checkpoint_dir = os.path.join(self.save_dir, 'checkpoints')
+        if not os.path.isdir(checkpoint_dir):
+            return
+
+        pattern = re.compile(r"checkpoint_step_(\d+)\.pth$")
+        checkpoints = []
+        for name in os.listdir(checkpoint_dir):
+            match = pattern.match(name)
+            if not match:
+                continue
+            checkpoints.append((int(match.group(1)), os.path.join(checkpoint_dir, name)))
+
+        checkpoints.sort(key=lambda item: item[0], reverse=True)
+        for _, path in checkpoints[max(keep_last, 0):]:
+            try:
+                os.remove(path)
+                self.logger.info(f"Removed old checkpoint: {os.path.basename(path)}")
+            except FileNotFoundError:
+                continue
     
     def load_checkpoint(self, checkpoint_path):
         """加载检查点"""
