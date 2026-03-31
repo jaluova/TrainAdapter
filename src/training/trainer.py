@@ -88,6 +88,7 @@ class CoordinateAdapterTrainer:
         self.best_loss = float('inf')
         self.best_acc_5 = -1.0
         self.best_acc_top4 = -1.0
+        self._accumulated_batches = 0
         self.qualitative_top_k = min(4, getattr(self.adapter, 'num_output_points', 4))
         self.qualitative_panel_indices = self._select_qualitative_indices()
         
@@ -134,7 +135,8 @@ class CoordinateAdapterTrainer:
             'best_loss': self.best_loss,
             'best_acc_5': self.best_acc_5,
             'best_acc_top4': self.best_acc_top4,
-            'loss_type': self.loss_type
+            'loss_type': self.loss_type,
+            'accumulated_batches': self._accumulated_batches
         }
         
         # 保存最新检查点
@@ -164,8 +166,30 @@ class CoordinateAdapterTrainer:
         self.best_loss = checkpoint['best_loss']
         self.best_acc_5 = checkpoint.get('best_acc_5', self.best_acc_5)
         self.best_acc_top4 = checkpoint.get('best_acc_top4', self.best_acc_top4)
+        # 恢复时重新开始梯度累积，避免依赖未保存的中间梯度状态。
+        self._accumulated_batches = 0
         
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
+
+    def _optimizer_step(self):
+        if self._accumulated_batches <= 0:
+            return
+
+        if self.use_amp:
+            self.scaler.unscale_(self.optimizer)
+        if self.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), self.max_grad_norm)
+
+        if self.use_amp:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+
+        if self.scheduler:
+            self.scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self._accumulated_batches = 0
 
     def _unwrap_dataset(self, dataset):
         if isinstance(dataset, Subset):
@@ -453,21 +477,9 @@ class CoordinateAdapterTrainer:
         else:
             loss.backward()
 
-        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
-            if self.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), self.max_grad_norm)
-
-            if self.use_amp:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-
-            if self.scheduler:
-                self.scheduler.step()
-            self.optimizer.zero_grad(set_to_none=True)
+        self._accumulated_batches += 1
+        if self._accumulated_batches >= self.gradient_accumulation_steps:
+            self._optimizer_step()
 
         return loss.item(), match_info
     
@@ -595,6 +607,7 @@ class CoordinateAdapterTrainer:
         
         self.logger.info(f"Start training for {num_epochs} epochs")
         self.optimizer.zero_grad(set_to_none=True)
+        self._accumulated_batches = 0
         
         for epoch in range(num_epochs):
             self.epoch = epoch
@@ -660,23 +673,12 @@ class CoordinateAdapterTrainer:
                 
                 except Exception as e:
                     self.optimizer.zero_grad(set_to_none=True)
+                    self._accumulated_batches = 0
                     self.logger.error(f"Error at step {self.global_step}: {str(e)}")
                     continue
 
-            pending_steps = self.global_step % self.gradient_accumulation_steps
-            if pending_steps != 0:
-                if self.use_amp:
-                    self.scaler.unscale_(self.optimizer)
-                if self.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), self.max_grad_norm)
-                if self.use_amp:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
-                if self.scheduler:
-                    self.scheduler.step()
-                self.optimizer.zero_grad(set_to_none=True)
+            if self._accumulated_batches > 0:
+                self._optimizer_step()
             
             #  epoch结束
             avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0.0

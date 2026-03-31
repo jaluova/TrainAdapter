@@ -4,223 +4,210 @@
 import os
 import sys
 import argparse
-import torch
 import json
+
+import torch
 from PIL import Image
-from torchvision import transforms
-import numpy as np
 
 # 添加src到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from models.adapter import CoordinateAdapter, LightweightCoordinateAdapter
-from utils.coordinate_parser import CoordinateParser
+from data.dataset import SimpleTokenizer
+from training.config import Config, get_config
+from train import create_adapter, load_qwen_model, setup_transforms
 
 
 class CoordinateAdapterInference:
     """
     Coordinate Adapter推理类
     """
-    def __init__(self, 
-                 adapter_path,
-                 qwen_model_path='Qwen2.5-VL-7B-Instruct',
-                 adapter_type='standard',
-                 device='cuda'):
+
+    def __init__(
+        self,
+        adapter_path,
+        qwen_model_path='Qwen2.5-VL-7B-Instruct',
+        adapter_type='standard',
+        device='cuda',
+        config=None,
+        num_output_points=None,
+        grid_size=None
+    ):
         """
         Args:
             adapter_path: Adapter模型路径
             qwen_model_path: Qwen2.5-VL模型路径
             adapter_type: Adapter类型
             device: 设备
+            config: 可选配置对象
         """
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.adapter_type = adapter_type
-        
-        # 加载Qwen2.5-VL模型
-        self.qwen_model = self._load_qwen_model(qwen_model_path)
-        
-        # 加载Coordinate Adapter
-        self.adapter = self._load_adapter(adapter_path, adapter_type)
-        
-        # 创建坐标解析器
-        self.parser = CoordinateParser()
-        
-        # 图像预处理
-        self.transform = transforms.Compose([
-            transforms.Resize((448, 448)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-        
+        self.config = config or get_config('default')
+        self.config.model.qwen_model_path = qwen_model_path
+        self.config.model.adapter_type = adapter_type
+        if num_output_points is not None:
+            self.config.model.num_output_points = num_output_points
+        if grid_size is not None:
+            self.config.model.grid_size = grid_size
+
+        self.qwen_model, self.tokenizer = load_qwen_model(self.config.model.qwen_model_path, self.device)
+        if hasattr(self.qwen_model, 'visual_dim'):
+            self.config.model.visual_dim = self.qwen_model.visual_dim
+
+        self.adapter = create_adapter(self.config)
+        self._load_adapter_weights(adapter_path)
+
+        if self.tokenizer is None:
+            self.tokenizer = SimpleTokenizer()
+
+        _, self.transform = setup_transforms(self.config)
         print(f"Model loaded successfully. Using device: {self.device}")
-    
-    def _load_qwen_model(self, model_path):
-        """加载Qwen2.5-VL模型"""
-        try:
-            from transformers import AutoModel
-            model = AutoModel.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                torch_dtype=torch.float16
-            ).to(self.device)
-            model.eval()
-            return model
-        except Exception as e:
-            print(f"Warning: Failed to load Qwen2.5-VL: {e}")
-            print("Using mock model for testing")
-            
-            # 创建模拟模型
-            class MockQwenModel:
-                def __init__(self, device):
-                    self.device = device
-                
-                def eval(self):
-                    pass
-                
-                def vision_encoder(self, images):
-                    B = images.shape[0]
-                    return torch.randn(B, 196, 768).to(self.device)
-                
-                def generate(self, **kwargs):
-                    inputs_embeds = kwargs.get('inputs_embeds')
-                    B = inputs_embeds.shape[0]
-                    # 模拟生成包含坐标的文本
-                    mock_text = "目标在[125, 240]位置"
-                    from transformers import AutoTokenizer
-                    tokenizer = AutoTokenizer.from_pretrained('gpt2')
-                    tokens = tokenizer.encode(mock_text, return_tensors='pt').to(self.device)
-                    return tokens.expand(B, -1)
-            
-            return MockQwenModel(self.device)
-    
-    def _load_adapter(self, adapter_path, adapter_type):
-        """加载Adapter模型"""
-        # 创建Adapter
-        if adapter_type == 'lightweight':
-            adapter = LightweightCoordinateAdapter()
-        else:
-            adapter = CoordinateAdapter()
-        
-        # 加载权重
-        if os.path.exists(adapter_path):
-            checkpoint = torch.load(adapter_path, map_location=self.device)
-            if 'model_state_dict' in checkpoint:
-                adapter.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                adapter.load_state_dict(checkpoint)
-            print(f"Loaded adapter from {adapter_path}")
-        else:
+
+    def _load_adapter_weights(self, adapter_path):
+        """加载Adapter权重。"""
+        if not os.path.exists(adapter_path):
             print(f"Warning: Adapter checkpoint not found at {adapter_path}")
             print("Using randomly initialized adapter")
-        
-        adapter.to(self.device)
-        adapter.eval()
-        
-        return adapter
-    
-    def preprocess_image(self, image_path):
+            self.adapter.to(self.device)
+            self.adapter.eval()
+            return
+
+        checkpoint = torch.load(adapter_path, map_location=self.device)
+        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+        missing_keys, unexpected_keys = self.adapter.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            print(f"Missing keys when loading adapter: {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected keys when loading adapter: {unexpected_keys}")
+
+        self.adapter.to(self.device)
+        self.adapter.eval()
+        print(f"Loaded adapter from {adapter_path}")
+
+    def preprocess_image(self, image_path, grid_image_path=None):
         """
         预处理图像
-        
+
         Args:
-            image_path: 图像路径
-            
+            image_path: 原始图像路径
+            grid_image_path: 可选网格图像路径
+
         Returns:
-            image_tensor, original_size
+            image_tensor, grid_image_tensor, original_size
         """
         image = Image.open(image_path).convert('RGB')
-        original_size = image.size  # (width, height)
-        
-        # 保存原始图像用于生成网格（这里简化处理，使用相同图像）
+        original_size = image.size
         image_tensor = self.transform(image).unsqueeze(0).to(self.device)
-        
-        return image_tensor, original_size
-    
-    def generate_grid_image(self, image, grid_size=(10, 10)):
-        """
-        生成网格图像（简化版本）
-        
-        Args:
-            image: 原始图像张量
-            grid_size: 网格大小
-            
-        Returns:
-            grid_image_tensor
-        """
-        # 这里简化处理：使用相同图像
-        # 实际应用中应该生成带坐标的网格图像
-        return image
-    
-    def predict(self, image_path, query, return_text=False):
+
+        if grid_image_path and os.path.exists(grid_image_path):
+            grid_image = Image.open(grid_image_path).convert('RGB')
+            grid_image_tensor = self.transform(grid_image).unsqueeze(0).to(self.device)
+        else:
+            grid_image_tensor = image_tensor.clone()
+
+        return image_tensor, grid_image_tensor, original_size
+
+    def _build_instruction(self, query):
+        return f"请根据网格坐标系，在图像中定位'{query}'的位置，输出坐标点[x,y]格式。"
+
+    def _encode_text(self, instruction):
+        encoding = self.tokenizer(
+            instruction,
+            padding='max_length',
+            truncation=True,
+            max_length=self.config.data.max_length,
+            return_tensors='pt'
+        )
+        return encoding['input_ids'].to(self.device), encoding['attention_mask'].to(self.device)
+
+    def _to_absolute_points(self, normalized_points, image_size):
+        width, height = image_size
+        return [
+            [round(float(x) * width, 2), round(float(y) * height, 2)]
+            for x, y in normalized_points
+        ]
+
+    def predict(self, image_path, query, return_text=False, grid_image_path=None, return_normalized=False):
         """
         预测坐标
-        
+
         Args:
             image_path: 图像路径
             query: 查询文本
-            return_text: 是否返回生成的文本
-            
+            return_text: 是否返回详细推理摘要
+            grid_image_path: 可选网格图像路径
+            return_normalized: 是否直接返回归一化预测详情
+
         Returns:
-            points: 预测的坐标点
-            text: 生成的文本（如果return_text=True）
+            绝对像素坐标列表，或详细预测摘要
         """
-        # 预处理图像
-        image, original_size = self.preprocess_image(image_path)
-        grid_image = self.generate_grid_image(image)
-        
-        # 构建文本指令
-        instruction = f"请根据网格坐标系，在图像中定位'{query}'的位置，输出坐标点[x,y]格式。"
-        
-        # 视觉编码（冻结）
+        image, grid_image, original_size = self.preprocess_image(
+            image_path,
+            grid_image_path=grid_image_path
+        )
+        instruction = self._build_instruction(query)
+        input_ids, attention_mask = self._encode_text(instruction)
+        adapter_dtype = next(self.adapter.parameters()).dtype
+
         with torch.no_grad():
-            visual_features = self.qwen_model.vision_encoder(image)
-            grid_visual_features = self.qwen_model.vision_encoder(grid_image)
-        
-        # Adapter增强
-        with torch.no_grad():
+            visual_features = self.qwen_model.encode_image(image)
+            if visual_features.dtype != adapter_dtype:
+                visual_features = visual_features.to(dtype=adapter_dtype)
+
             enhanced_features = self.adapter(image, grid_image, visual_features)
-        
-        # 生成文本（冻结）
-        with torch.no_grad():
-            outputs = self.qwen_model.generate(
-                inputs_embeds=enhanced_features,
-                max_length=100,
-                do_sample=True,
-                temperature=0.7
-            )
-        
-        # 解码文本
-        # 注意：这里简化处理，实际需要从outputs解码
-        generated_text = f"目标在[125, 240]位置"  # 模拟输出
-        
-        # 解析坐标
-        points = self.parser.parse(generated_text)
-        
-        # 验证和裁剪坐标
-        if points:
-            points = self.parser.clip(points)
-        
+
+            text_embeddings = self.qwen_model.encode_text(input_ids, attention_mask)
+            if text_embeddings.dtype != adapter_dtype:
+                text_embeddings = text_embeddings.to(dtype=adapter_dtype)
+
+            if getattr(self.adapter, 'output_mode', 'point_regression') == 'grid_logits':
+                pred_grid_logits = self.adapter.predict_grid_logits(
+                    enhanced_features,
+                    text_features=text_embeddings,
+                    attention_mask=attention_mask
+                )
+                pred_points, pred_logits = self.adapter.decode_grid_logits(
+                    pred_grid_logits,
+                    top_k=self.adapter.num_output_points
+                )
+            else:
+                pred_points, pred_logits = self.adapter.predict_point_regression(
+                    enhanced_features,
+                    text_features=text_embeddings,
+                    attention_mask=attention_mask
+                )
+
+        normalized_points = pred_points[0].detach().cpu().tolist()
+        scores = torch.sigmoid(pred_logits[0]).detach().cpu().tolist()
+        absolute_points = self._to_absolute_points(normalized_points, original_size)
+        summary = {
+            'query': query,
+            'instruction': instruction,
+            'output_mode': getattr(self.adapter, 'output_mode', 'point_regression'),
+            'normalized_points': [[round(float(x), 4), round(float(y), 4)] for x, y in normalized_points],
+            'absolute_points': absolute_points,
+            'scores': [round(float(score), 4) for score in scores],
+            'image_size': list(original_size)
+        }
+
+        if return_normalized:
+            return summary
         if return_text:
-            return points, generated_text
-        else:
-            return points
-    
+            return absolute_points, json.dumps(summary, ensure_ascii=False, indent=2)
+        return absolute_points
+
     def batch_predict(self, image_paths, queries):
         """
         批量预测
-        
+
         Args:
             image_paths: 图像路径列表
             queries: 查询列表
-            
+
         Returns:
             results: 结果列表
         """
         results = []
-        
+
         for image_path, query in zip(image_paths, queries):
             try:
                 points = self.predict(image_path, query)
@@ -238,109 +225,132 @@ class CoordinateAdapterInference:
                     'status': 'error',
                     'error_message': str(e)
                 })
-        
+
         return results
-    
+
     def save_prediction(self, image_path, query, points, save_dir='predictions'):
         """
         保存预测结果（包括可视化）
-        
+
         Args:
             image_path: 图像路径
             query: 查询文本
-            points: 预测的坐标点
+            points: 预测的像素坐标点
             save_dir: 保存目录
         """
         os.makedirs(save_dir, exist_ok=True)
-        
-        # 复制图像
+
         image_name = os.path.basename(image_path)
         save_path = os.path.join(save_dir, image_name)
-        
-        # 加载图像
+
         image = Image.open(image_path).convert('RGB')
-        
-        # 在图像上绘制预测点
+
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
-        
+
         fig, ax = plt.subplots(1, figsize=(10, 10))
         ax.imshow(image)
-        
-        # 绘制点
+
         for idx, point in enumerate(points):
             x, y = point
-            # 绘制圆圈
             circle = patches.Circle((x, y), radius=10, color='red', fill=False, linewidth=2)
             ax.add_patch(circle)
-            # 绘制中心点
             ax.plot(x, y, 'ro', markersize=5)
-            # 添加标签
-            ax.text(x + 15, y - 15, f'{idx+1}', color='red', fontsize=12, weight='bold')
-        
-        # 添加标题
+            ax.text(x + 15, y - 15, f'{idx + 1}', color='red', fontsize=12, weight='bold')
+
         ax.set_title(f'Query: {query}', fontsize=14)
         ax.axis('off')
-        
-        # 保存图像
+
         plt.savefig(save_path, bbox_inches='tight', dpi=150)
         plt.close()
-        
-        # 保存结果JSON
+
         result = {
             'image_path': image_path,
             'query': query,
             'points': points,
             'image_size': image.size
         }
-        
+
         json_path = os.path.join(save_dir, f"{os.path.splitext(image_name)[0]}.json")
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
-        
+
         print(f"Prediction saved to {save_path} and {json_path}")
 
 
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='Coordinate Adapter Inference')
-    
+
     parser.add_argument('--adapter_path', type=str, required=True, help='Adapter模型路径')
+    parser.add_argument('--config', type=str, default=None, help='训练时保存的config.json路径')
     parser.add_argument('--qwen_model_path', type=str, default='Qwen2.5-VL-7B-Instruct', help='Qwen模型路径')
     parser.add_argument('--adapter_type', type=str, default='standard', choices=['standard', 'lightweight'], help='Adapter类型')
     parser.add_argument('--image_path', type=str, required=True, help='图像路径')
+    parser.add_argument('--grid_image_path', type=str, default=None, help='可选的网格图像路径')
     parser.add_argument('--query', type=str, required=True, help='查询文本')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
+    parser.add_argument('--num_output_points', type=int, default=None, help='覆盖config中的top-k输出数量')
+    parser.add_argument('--grid_size', type=int, default=None, help='覆盖config中的网格边长')
     parser.add_argument('--save_pred', action='store_true', help='保存预测结果')
     parser.add_argument('--save_dir', type=str, default='predictions', help='保存目录')
-    parser.add_argument('--return_text', action='store_true', help='返回生成的文本')
-    
+    parser.add_argument('--return_text', action='store_true', help='返回详细预测摘要')
+    parser.add_argument('--return_normalized', action='store_true', help='输出归一化坐标和分数')
+
     args = parser.parse_args()
-    
-    # 创建推理器
+
+    config = Config.load(args.config) if args.config and os.path.exists(args.config) else get_config('default')
+    if args.qwen_model_path:
+        config.model.qwen_model_path = args.qwen_model_path
+    if args.adapter_type:
+        config.model.adapter_type = args.adapter_type
+    if args.num_output_points is not None:
+        config.model.num_output_points = args.num_output_points
+    if args.grid_size is not None:
+        config.model.grid_size = args.grid_size
+
     inferencer = CoordinateAdapterInference(
         adapter_path=args.adapter_path,
-        qwen_model_path=args.qwen_model_path,
-        adapter_type=args.adapter_type,
-        device=args.device
+        qwen_model_path=config.model.qwen_model_path,
+        adapter_type=config.model.adapter_type,
+        device=args.device,
+        config=config,
+        num_output_points=args.num_output_points,
+        grid_size=args.grid_size
     )
-    
-    # 预测
-    if args.return_text:
-        points, text = inferencer.predict(args.image_path, args.query, return_text=True)
-        print(f"Generated text: {text}")
+
+    if args.return_normalized:
+        prediction_payload = inferencer.predict(
+            args.image_path,
+            args.query,
+            grid_image_path=args.grid_image_path,
+            return_normalized=True
+        )
+        points = prediction_payload['absolute_points']
+        print(json.dumps(prediction_payload, ensure_ascii=False, indent=2))
+    elif args.return_text:
+        points, text = inferencer.predict(
+            args.image_path,
+            args.query,
+            return_text=True,
+            grid_image_path=args.grid_image_path
+        )
+        print(f"Prediction summary: {text}")
     else:
-        points = inferencer.predict(args.image_path, args.query)
-    
+        points = inferencer.predict(
+            args.image_path,
+            args.query,
+            grid_image_path=args.grid_image_path
+        )
+
     print(f"Query: {args.query}")
     print(f"Predicted points: {points}")
-    
-    # 保存结果
+
     if args.save_pred:
         inferencer.save_prediction(
-            args.image_path, 
-            args.query, 
-            points, 
+            args.image_path,
+            args.query,
+            points,
             args.save_dir
         )
 

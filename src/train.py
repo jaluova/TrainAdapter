@@ -20,7 +20,7 @@ from models.adapter import CoordinateAdapter, LightweightCoordinateAdapter
 from data.dataset import CoordinateDataset, collate_fn_pad_batch, split_indices_by_image
 from loss.hungarian_loss import HungarianPointLoss
 from training.trainer import CoordinateAdapterTrainer, create_optimizer_and_scheduler
-from training.config import get_config, CONFIG_PRESETS
+from training.config import Config, get_config, CONFIG_PRESETS
 from utils.coordinate_parser import CoordinateParser
 
 
@@ -400,7 +400,7 @@ def main():
     
     # 加载配置
     if args.config and os.path.exists(args.config):
-        config = get_config().load(args.config)
+        config = Config.load(args.config)
         print(f"Loaded config from {args.config}")
     else:
         config = get_config(args.preset)

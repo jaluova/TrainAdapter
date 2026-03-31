@@ -154,7 +154,7 @@ def load_adapter_checkpoint(adapter, checkpoint_path, device):
     return checkpoint
 
 
-def run_prediction(adapter, qwen_model, batch, device):
+def run_prediction(adapter, qwen_model, batch, device, top_k):
     images = batch["image"].to(device)
     grid_images = batch["grid_image"].to(device)
     input_ids = batch["input_ids"].to(device)
@@ -180,7 +180,7 @@ def run_prediction(adapter, qwen_model, batch, device):
             )
             pred_points, pred_logits = adapter.decode_grid_logits(
                 pred_grid_logits,
-                top_k=adapter.num_output_points
+                top_k=max(1, top_k)
             )
         else:
             pred_points, pred_logits = adapter.predict_point_regression(
@@ -253,7 +253,7 @@ def render_visual(sample, pred_points, pred_logits, output_path, top_k):
     data_root = sample["data_root"]
 
     original_path = os.path.join(data_root, "images", image_id)
-    grid_path = os.path.join(data_root, "grid_images", image_id)
+    grid_path = os.path.join(data_root, "grid_images", os.path.basename(sample.get("grid_image_path", image_id)))
 
     original_img = Image.open(original_path).convert("RGB")
     if os.path.exists(grid_path):
@@ -403,13 +403,14 @@ def main():
         item = dataset[sample_idx]
         sample_meta = dict(dataset.samples[sample_idx])
         batch = collate_fn_pad_batch([item])
-        pred_points, pred_logits = run_prediction(adapter, qwen_model, batch, device)
+        pred_points, pred_logits = run_prediction(adapter, qwen_model, batch, device, args.top_k)
         render_item = {
             "image_id": sample_meta["image_id"],
             "query": item["query"],
             "gt_points": item["gt_points"],
             "image_size": item["image_size"],
             "data_root": config.data.data_root,
+            "grid_image_path": sample_meta.get("grid_image_path", sample_meta["image_id"]),
         }
         output_path = output_dir / f"sample_{sample_idx:04d}_{sample_meta['image_id']}"
         render_visual(render_item, pred_points, pred_logits, str(output_path.with_suffix(".png")), args.top_k)
