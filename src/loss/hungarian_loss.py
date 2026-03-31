@@ -334,7 +334,14 @@ class HungarianPointLoss(nn.Module):
 
         for batch_idx in range(pred_grid_logits.shape[0]):
             gt_points = gt_points_list[batch_idx]
-            gt_tensor = torch.as_tensor(gt_points, dtype=pred_points.dtype) if gt_points else pred_points.new_zeros((0, 2))
+            gt_tensor = (
+                torch.as_tensor(
+                    gt_points,
+                    dtype=pred_points.dtype,
+                    device=pred_points.device
+                )
+                if gt_points else pred_points.new_zeros((0, 2))
+            )
             min_grid_distance = None
             if gt_tensor.numel() > 0:
                 min_grid_distance = torch.cdist(pred_points[batch_idx], gt_tensor, p=2).min().item()

@@ -207,7 +207,7 @@ def get_default_config():
     config.model.grid_feature_dim = 256
     config.model.hidden_dim = 256
     config.model.num_heads = 4
-    config.model.num_grid_tokens = 32
+    config.model.num_grid_tokens = 25
     config.model.output_mode = 'grid_logits'
 
     config.data.target_point_strategy = 'all'
@@ -235,7 +235,7 @@ def get_lightweight_config():
     config.model.grid_feature_dim = 256
     config.model.hidden_dim = 256
     config.model.num_heads = 4
-    config.model.num_grid_tokens = 32
+    config.model.num_grid_tokens = 25
     
     return config
 

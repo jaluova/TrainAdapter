@@ -4,6 +4,7 @@ Coordinate Adapter: 主适配器模块
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .grid_encoder import GridEncoder, FeatureProjector
 from .cross_attention import CrossAttention, GatedFusion, ResidualFFN
@@ -134,7 +135,7 @@ class BaseCoordinateAdapter(nn.Module):
             visual_summary=visual_summary
         )
 
-        conditioned_tokens = torch.gelu(
+        conditioned_tokens = F.gelu(
             self.visual_condition_proj(visual_features) +
             self.text_condition_proj(text_summary).unsqueeze(1)
         )
@@ -239,7 +240,7 @@ class LightweightCoordinateAdapter(BaseCoordinateAdapter):
         grid_feature_dim=256,
         hidden_dim=256,
         num_heads=4,
-        num_grid_tokens=32,
+        num_grid_tokens=25,
         num_output_points=4,
         dropout=0.1,
         output_mode='grid_logits',
