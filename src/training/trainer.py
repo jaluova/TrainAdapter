@@ -5,9 +5,8 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from tqdm import tqdm
 import json
 import logging
@@ -33,7 +32,9 @@ class CoordinateAdapterTrainer:
                  gradient_accumulation_steps=1,
                  log_interval=10,
                  eval_interval=500,
-                 save_interval=1000):
+                 save_interval=1000,
+                 loss_type='hungarian_point',
+                 use_amp=False):
         """
         Args:
             adapter: Coordinate Adapter模型
@@ -65,6 +66,9 @@ class CoordinateAdapterTrainer:
         self.log_interval = log_interval
         self.eval_interval = eval_interval
         self.save_interval = save_interval
+        self.loss_type = loss_type
+        self.use_amp = bool(use_amp and str(device).startswith('cuda'))
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         
         # 创建保存目录
         os.makedirs(save_dir, exist_ok=True)
@@ -83,6 +87,7 @@ class CoordinateAdapterTrainer:
         self.epoch = 0
         self.best_loss = float('inf')
         self.best_acc_5 = -1.0
+        self.best_acc_top4 = -1.0
         self.qualitative_top_k = min(4, getattr(self.adapter, 'num_output_points', 4))
         self.qualitative_panel_indices = self._select_qualitative_indices()
         
@@ -127,7 +132,9 @@ class CoordinateAdapterTrainer:
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'loss': loss,
             'best_loss': self.best_loss,
-            'best_acc_5': self.best_acc_5
+            'best_acc_5': self.best_acc_5,
+            'best_acc_top4': self.best_acc_top4,
+            'loss_type': self.loss_type
         }
         
         # 保存最新检查点
@@ -156,11 +163,22 @@ class CoordinateAdapterTrainer:
         self.epoch = checkpoint['epoch']
         self.best_loss = checkpoint['best_loss']
         self.best_acc_5 = checkpoint.get('best_acc_5', self.best_acc_5)
+        self.best_acc_top4 = checkpoint.get('best_acc_top4', self.best_acc_top4)
         
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
 
+    def _unwrap_dataset(self, dataset):
+        if isinstance(dataset, Subset):
+            return dataset.dataset, dataset.indices
+        return dataset, list(range(len(dataset)))
+
+    def _dataset_sample_meta(self, dataset, idx):
+        base_dataset, indices = self._unwrap_dataset(dataset)
+        base_idx = indices[idx]
+        return base_dataset.samples[base_idx], base_dataset, base_idx
+
     def _select_qualitative_indices(self, count=6):
-        """固定一组验证样本，避免每次评估都换图。"""
+        """固定一组验证样本，至少优先覆盖关系词样本。"""
         if self.val_dataloader is None or not hasattr(self.val_dataloader, 'dataset'):
             return []
 
@@ -169,13 +187,37 @@ class CoordinateAdapterTrainer:
             return []
 
         count = min(count, len(dataset))
-        if count == len(dataset):
-            return list(range(len(dataset)))
-        if count == 1:
-            return [0]
+        relation_indices = []
+        non_relation_indices = []
+        for idx in range(len(dataset)):
+            item = dataset[idx]
+            if item.get('is_relation_query', False):
+                relation_indices.append(idx)
+            else:
+                non_relation_indices.append(idx)
 
-        step = (len(dataset) - 1) / float(count - 1)
-        return sorted({round(i * step) for i in range(count)})
+        selected = []
+        desired_relation = min(3, count, len(relation_indices))
+        if desired_relation > 0:
+            step = max(len(relation_indices) / float(desired_relation), 1.0)
+            selected.extend(
+                relation_indices[min(int(round(i * step)), len(relation_indices) - 1)]
+                for i in range(desired_relation)
+            )
+
+        remaining = count - len(selected)
+        pool = [idx for idx in range(len(dataset)) if idx not in selected]
+        if remaining > 0 and pool:
+            if remaining >= len(pool):
+                selected.extend(pool)
+            else:
+                step = max(len(pool) / float(remaining), 1.0)
+                selected.extend(
+                    pool[min(int(round(i * step)), len(pool) - 1)]
+                    for i in range(remaining)
+                )
+
+        return sorted(set(selected))
 
     def _load_font(self, size, bold=False):
         candidates = [
@@ -242,15 +284,16 @@ class CoordinateAdapterTrainer:
             for sample_idx in self.qualitative_panel_indices:
                 item = dataset[sample_idx]
                 batch = collate_fn_pad_batch([item])
-                pred_points, pred_logits = self.forward_batch(batch)
-                pred_points = pred_points[0].detach().cpu().tolist()
-                pred_scores = torch.sigmoid(pred_logits[0]).detach().cpu().tolist()
+                outputs = self.forward_batch(batch)
+                pred_points = outputs['pred_points'][0].detach().cpu().tolist()
+                pred_scores = torch.sigmoid(outputs['pred_logits'][0]).detach().cpu().tolist()
                 ranked = self._rank_predictions(pred_points, pred_scores)
 
-                image_id = dataset.samples[sample_idx]['image_id']
+                sample_meta, base_dataset, _ = self._dataset_sample_meta(dataset, sample_idx)
+                image_id = sample_meta['image_id']
                 image_size = item['image_size']
-                original_path = os.path.join(dataset.data_root, dataset.image_dir, image_id)
-                grid_path = os.path.join(dataset.data_root, dataset.grid_image_dir, os.path.basename(dataset.samples[sample_idx]['grid_image_path']))
+                original_path = os.path.join(base_dataset.data_root, base_dataset.image_dir, image_id)
+                grid_path = os.path.join(base_dataset.data_root, base_dataset.grid_image_dir, os.path.basename(sample_meta['grid_image_path']))
 
                 original_img = Image.open(original_path).convert('RGB')
                 if os.path.exists(grid_path):
@@ -294,8 +337,8 @@ class CoordinateAdapterTrainer:
                 footer_y = top_y + max(original_img.height, grid_img.height) + 24
                 draw.rounded_rectangle([30, footer_y, canvas_w - 30, canvas_h - 24], radius=18, fill="white", outline="#d7deea", width=2)
                 draw.text((50, footer_y + 18), "Readout", fill="#162033", font=body_font)
-                draw.text((50, footer_y + 50), "Blue dots are sampled supervision points; red circles are top confidence predictions.", fill="#334155", font=small_font)
-                draw.text((50, footer_y + 74), "Scores come from sigmoid(pred_logits); training and evaluation both operate in normalized grid coordinates.", fill="#334155", font=small_font)
+                draw.text((50, footer_y + 50), "Blue dots are target grid points; red circles are top confidence predictions decoded from grid logits.", fill="#334155", font=small_font)
+                draw.text((50, footer_y + 74), "Scores come from sigmoid(top-k logits); training and evaluation both operate in normalized grid coordinates.", fill="#334155", font=small_font)
 
                 output_prefix = os.path.join(panel_dir, f"sample_{sample_idx:04d}_{image_id}")
                 canvas.save(f"{output_prefix}.png")
@@ -315,41 +358,57 @@ class CoordinateAdapterTrainer:
     
     def forward_batch(self, batch):
         """
-        前向计算：提取冻结特征，经过Adapter预测坐标点
+        前向计算：提取冻结特征，经过Adapter预测网格 logits / 坐标点
         
         Args:
             batch: 批次数据
             
         Returns:
-            pred_points: [B, K, 2]
-            pred_logits: [B, K]
+            outputs: 包含 pred_points / pred_logits / pred_grid_logits
         """
-        # 提取批次数据
         images = batch['image'].to(self.device)
         grid_images = batch['grid_image'].to(self.device)
         input_ids = batch['input_ids'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)
-        
-        batch_size = images.shape[0]
         adapter_dtype = next(self.adapter.parameters()).dtype
-        
-        # 1. 视觉编码（冻结）
-        with torch.no_grad():
-            visual_features = self.qwen_model.encode_image(images)
-            if visual_features.dtype != adapter_dtype:
-                visual_features = visual_features.to(dtype=adapter_dtype)
-        
-        # 2. Adapter增强（可训练）
-        enhanced_features = self.adapter(images, grid_images, visual_features)
-        
-        # 3. 文本编码（冻结）
-        with torch.no_grad():
-            text_embeddings = self.qwen_model.encode_text(input_ids, attention_mask)
-            if text_embeddings.dtype != adapter_dtype:
-                text_embeddings = text_embeddings.to(dtype=adapter_dtype)
 
-        pred_points, pred_logits = self.adapter.predict_points(enhanced_features, text_embeddings)
-        return pred_points, pred_logits
+        autocast_enabled = self.use_amp and str(self.device).startswith('cuda')
+        with torch.cuda.amp.autocast(enabled=autocast_enabled):
+            with torch.no_grad():
+                visual_features = self.qwen_model.encode_image(images)
+                if visual_features.dtype != adapter_dtype:
+                    visual_features = visual_features.to(dtype=adapter_dtype)
+
+            enhanced_features = self.adapter(images, grid_images, visual_features)
+
+            with torch.no_grad():
+                text_embeddings = self.qwen_model.encode_text(input_ids, attention_mask)
+                if text_embeddings.dtype != adapter_dtype:
+                    text_embeddings = text_embeddings.to(dtype=adapter_dtype)
+
+            if getattr(self.adapter, 'output_mode', 'point_regression') == 'grid_logits':
+                pred_grid_logits = self.adapter.predict_grid_logits(
+                    enhanced_features,
+                    text_features=text_embeddings,
+                    attention_mask=attention_mask
+                )
+                pred_points, pred_logits = self.adapter.decode_grid_logits(
+                    pred_grid_logits,
+                    top_k=self.qualitative_top_k
+                )
+            else:
+                pred_grid_logits = None
+                pred_points, pred_logits = self.adapter.predict_point_regression(
+                    enhanced_features,
+                    text_features=text_embeddings,
+                    attention_mask=attention_mask
+                )
+
+        return {
+            'pred_points': pred_points,
+            'pred_logits': pred_logits,
+            'pred_grid_logits': pred_grid_logits
+        }
     
     def train_step(self, batch):
         """
@@ -364,38 +423,52 @@ class CoordinateAdapterTrainer:
         # 设置为训练模式
         self.adapter.train()
         
-        pred_points, pred_logits = self.forward_batch(batch)
-        
-        # 获取真值数据
+        outputs = self.forward_batch(batch)
         gt_points_list = batch['gt_points']
+        grid_targets = batch['grid_target'].to(self.device)
         image_sizes = batch['image_size']
-        
-        # 计算损失
-        loss, match_info = self.loss_fn(
-            pred_points=pred_points,
-            pred_logits=pred_logits,
-            gt_points_list=gt_points_list,
-            image_sizes=image_sizes
-        )
-        
-        # 反向传播
-        loss.backward()
-        
-        # 梯度累积
+
+        if outputs['pred_grid_logits'] is not None and self.loss_type == 'bce_grid':
+            loss, match_info = self.loss_fn(
+                pred_grid_logits=outputs['pred_grid_logits'],
+                grid_targets=grid_targets,
+                gt_points_list=gt_points_list,
+                top_k=self.qualitative_top_k
+            )
+        else:
+            loss, match_info = self.loss_fn(
+                pred_points=outputs['pred_points'],
+                pred_logits=outputs['pred_logits'],
+                gt_points_list=gt_points_list,
+                image_sizes=image_sizes
+            )
+
+        for sample_idx, info in enumerate(match_info):
+            info['is_relation_query'] = bool(batch['is_relation_query'][sample_idx].item())
+            info['query'] = batch['query'][sample_idx]
+            info['image_id'] = batch['image_id'][sample_idx]
+
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
         if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-            # 梯度裁剪
+            if self.use_amp:
+                self.scaler.unscale_(self.optimizer)
             if self.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.adapter.parameters(), 
-                    self.max_grad_norm
-                )
-            
-            # 更新参数
-            self.optimizer.step()
+                torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), self.max_grad_norm)
+
+            if self.use_amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+
             if self.scheduler:
                 self.scheduler.step()
-            self.optimizer.zero_grad()
-        
+            self.optimizer.zero_grad(set_to_none=True)
+
         return loss.item(), match_info
     
     def evaluate(self):
@@ -417,19 +490,30 @@ class CoordinateAdapterTrainer:
         
         with torch.no_grad():
             for batch in tqdm(self.val_dataloader, desc='Evaluating'):
-                pred_points, pred_logits = self.forward_batch(batch)
-                
-                # 获取真值数据
+                outputs = self.forward_batch(batch)
                 gt_points_list = batch['gt_points']
+                grid_targets = batch['grid_target'].to(self.device)
                 image_sizes = batch['image_size']
-                
-                # 计算损失
-                loss, match_info = self.loss_fn(
-                    pred_points=pred_points,
-                    pred_logits=pred_logits,
-                    gt_points_list=gt_points_list,
-                    image_sizes=image_sizes
-                )
+
+                if outputs['pred_grid_logits'] is not None and self.loss_type == 'bce_grid':
+                    loss, match_info = self.loss_fn(
+                        pred_grid_logits=outputs['pred_grid_logits'],
+                        grid_targets=grid_targets,
+                        gt_points_list=gt_points_list,
+                        top_k=self.qualitative_top_k
+                    )
+                else:
+                    loss, match_info = self.loss_fn(
+                        pred_points=outputs['pred_points'],
+                        pred_logits=outputs['pred_logits'],
+                        gt_points_list=gt_points_list,
+                        image_sizes=image_sizes
+                    )
+
+                for sample_idx, info in enumerate(match_info):
+                    info['is_relation_query'] = bool(batch['is_relation_query'][sample_idx].item())
+                    info['query'] = batch['query'][sample_idx]
+                    info['image_id'] = batch['image_id'][sample_idx]
                 
                 total_loss += loss.item()
                 total_samples += len(batch['image'])
@@ -455,44 +539,47 @@ class CoordinateAdapterTrainer:
         Returns:
             metrics: 指标字典
         """
-        total_l1_error = 0.0
+        all_min_distances = []
+        acc_1grid = 0
+        acc_top4 = 0
+        relation_acc_top4 = 0
+        relation_count = 0
         total_samples = 0
-        acc_5 = 0
-        acc_10 = 0
-        
+
         for info in match_info:
             pred_points = info['pred_points']
             gt_points = info['gt_points']
-            pred_scores = info.get('pred_scores', [1.0] * len(pred_points))
-            
             if len(pred_points) == 0 or len(gt_points) == 0:
                 continue
 
-            ranked_points = [point for point, _ in self._rank_predictions(pred_points, pred_scores)]
-            
-            # 计算最近距离
-            for gt_point in gt_points:
-                min_dist = float('inf')
-                for pred_point in ranked_points:
-                    dist = np.linalg.norm(np.array(pred_point) - np.array(gt_point))
-                    min_dist = min(min_dist, dist)
-                
-                total_l1_error += min_dist
-                total_samples += 1
-                
-                # 计算准确率
-                if min_dist < 0.05:
-                    acc_5 += 1
-                if min_dist < 0.1:
-                    acc_10 += 1
-        
+            pred_arr = np.asarray(pred_points, dtype=np.float32)
+            gt_arr = np.asarray(gt_points, dtype=np.float32)
+            distances = np.linalg.norm(pred_arr[:, None, :] - gt_arr[None, :, :], axis=-1)
+            min_distance = float(distances.min())
+            all_min_distances.append(min_distance)
+            total_samples += 1
+
+            top1_hit = bool((distances[0] < 1e-6).any())
+            top4_hit = bool((distances[:min(4, len(pred_points))] < 1e-6).any())
+            acc_1grid += int(top1_hit)
+            acc_top4 += int(top4_hit)
+
+            if info.get('is_relation_query', False):
+                relation_count += 1
+                relation_acc_top4 += int(top4_hit)
+
         metrics = {
-            'l1_error': total_l1_error / total_samples if total_samples > 0 else 0.0,
-            'acc_5': acc_5 / total_samples if total_samples > 0 else 0.0,
-            'acc_10': acc_10 / total_samples if total_samples > 0 else 0.0,
-            'total_samples': total_samples
+            'mean_min_grid_distance': float(np.mean(all_min_distances)) if all_min_distances else 0.0,
+            'acc_1grid': acc_1grid / total_samples if total_samples > 0 else 0.0,
+            'acc_top4': acc_top4 / total_samples if total_samples > 0 else 0.0,
+            'relation_acc_top4': relation_acc_top4 / relation_count if relation_count > 0 else 0.0,
+            'total_samples': total_samples,
+            'relation_samples': relation_count,
         }
-        
+
+        metrics['l1_error'] = metrics['mean_min_grid_distance']
+        metrics['acc_5'] = metrics['acc_top4']
+        metrics['acc_10'] = metrics['acc_top4']
         return metrics
     
     def train(self, num_epochs, resume_from=None):
@@ -515,6 +602,7 @@ class CoordinateAdapterTrainer:
             
             epoch_loss = 0.0
             num_batches = 0
+            relation_epoch_losses = []
             
             # 训练
             for batch_idx, batch in enumerate(tqdm(self.train_dataloader, desc=f'Training Epoch {epoch + 1}')):
@@ -524,13 +612,23 @@ class CoordinateAdapterTrainer:
                     epoch_loss += loss
                     num_batches += 1
                     self.global_step += 1
+
+                    relation_sample_losses = [
+                        info['sample_loss'] for info in match_info
+                        if info.get('is_relation_query', False)
+                    ]
+                    if relation_sample_losses:
+                        relation_epoch_losses.extend(relation_sample_losses)
                     
                     # 日志
                     if self.global_step % self.log_interval == 0:
-                        self.logger.info(
+                        log_message = (
                             f"Step {self.global_step}, Loss: {loss:.4f}, "
                             f"Avg Loss: {epoch_loss / num_batches:.4f}"
                         )
+                        if relation_sample_losses:
+                            log_message += f", Relation Loss: {np.mean(relation_sample_losses):.4f}"
+                        self.logger.info(log_message)
                     
                     # 验证
                     if self.val_dataloader and self.global_step % self.eval_interval == 0:
@@ -538,19 +636,21 @@ class CoordinateAdapterTrainer:
                         if val_loss is not None:
                             self.logger.info(
                                 f"Validation - Loss: {val_loss:.4f}, "
-                                f"L1 Error: {metrics['l1_error']:.4f}, "
-                                f"Acc@5: {metrics['acc_5']:.2%}, "
-                                f"Acc@10: {metrics['acc_10']:.2%}"
+                                f"Mean Min Grid Distance: {metrics['mean_min_grid_distance']:.4f}, "
+                                f"Acc@1Grid: {metrics['acc_1grid']:.2%}, "
+                                f"Acc@Top4: {metrics['acc_top4']:.2%}, "
+                                f"Relation Acc@Top4: {metrics['relation_acc_top4']:.2%}"
                             )
                             if metrics.get('qualitative_panel_dir'):
                                 self.logger.info(f"Saved qualitative panel to {metrics['qualitative_panel_dir']}")
                             
                             # 保存最佳模型
                             if (
-                                metrics['acc_5'] > self.best_acc_5 or
-                                (metrics['acc_5'] == self.best_acc_5 and val_loss < self.best_loss)
+                                metrics['acc_top4'] > self.best_acc_top4 or
+                                (metrics['acc_top4'] == self.best_acc_top4 and val_loss < self.best_loss)
                             ):
-                                self.best_acc_5 = metrics['acc_5']
+                                self.best_acc_5 = metrics['acc_top4']
+                                self.best_acc_top4 = metrics['acc_top4']
                                 self.best_loss = val_loss
                                 self.save_checkpoint(self.global_step, val_loss, is_best=True)
                     
@@ -562,10 +662,31 @@ class CoordinateAdapterTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
                     self.logger.error(f"Error at step {self.global_step}: {str(e)}")
                     continue
+
+            pending_steps = self.global_step % self.gradient_accumulation_steps
+            if pending_steps != 0:
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                if self.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), self.max_grad_norm)
+                if self.use_amp:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                if self.scheduler:
+                    self.scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)
             
             #  epoch结束
             avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
-            self.logger.info(f"Epoch {epoch + 1} completed, Avg Loss: {avg_epoch_loss:.4f}")
+            if relation_epoch_losses:
+                self.logger.info(
+                    f"Epoch {epoch + 1} completed, Avg Loss: {avg_epoch_loss:.4f}, "
+                    f"Relation Avg Loss: {np.mean(relation_epoch_losses):.4f}"
+                )
+            else:
+                self.logger.info(f"Epoch {epoch + 1} completed, Avg Loss: {avg_epoch_loss:.4f}")
             
             # 保存epoch检查点
             self.save_checkpoint(self.global_step, avg_epoch_loss)

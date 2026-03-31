@@ -102,7 +102,11 @@ def build_dataset(config):
         transform=val_transform,
         num_output_points=config.model.num_output_points,
         target_point_strategy=config.data.target_point_strategy,
-        target_coordinate_mode=config.data.target_coordinate_mode
+        target_coordinate_mode=config.data.target_coordinate_mode,
+        output_mode=config.model.output_mode,
+        grid_size=config.model.grid_size,
+        neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+        relation_keywords=config.data.relation_keywords
     )
     return dataset
 
@@ -168,7 +172,22 @@ def run_prediction(adapter, qwen_model, batch, device):
         if text_embeddings.dtype != adapter_dtype:
             text_embeddings = text_embeddings.to(dtype=adapter_dtype)
 
-        pred_points, pred_logits = adapter.predict_points(enhanced_features, text_embeddings)
+        if getattr(adapter, "output_mode", "point_regression") == "grid_logits":
+            pred_grid_logits = adapter.predict_grid_logits(
+                enhanced_features,
+                text_features=text_embeddings,
+                attention_mask=attention_mask
+            )
+            pred_points, pred_logits = adapter.decode_grid_logits(
+                pred_grid_logits,
+                top_k=adapter.num_output_points
+            )
+        else:
+            pred_points, pred_logits = adapter.predict_point_regression(
+                enhanced_features,
+                text_features=text_embeddings,
+                attention_mask=attention_mask
+            )
 
     return pred_points[0].detach().cpu(), pred_logits[0].detach().cpu()
 

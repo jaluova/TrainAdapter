@@ -21,13 +21,21 @@ class HungarianPointLoss(nn.Module):
                  inside_bbox_weight=1.0,
                  outside_bbox_weight=0.1,
                  match_cost='euclidean',
-                 boundary_penalty_weight=0.1):
+                 boundary_penalty_weight=0.1,
+                 loss_type='hungarian_point',
+                 grid_size=11,
+                 grid_pos_weight=4.0,
+                 neighbor_soft_label_weight=0.3):
         super(HungarianPointLoss, self).__init__()
         
         self.inside_bbox_weight = inside_bbox_weight
         self.outside_bbox_weight = outside_bbox_weight
         self.match_cost = match_cost
         self.boundary_penalty_weight = boundary_penalty_weight
+        self.loss_type = loss_type
+        self.grid_size = grid_size
+        self.grid_pos_weight = grid_pos_weight
+        self.neighbor_soft_label_weight = neighbor_soft_label_weight
         
     def parse_coordinates_from_text(self, text_outputs, image_width, image_height):
         """
@@ -294,6 +302,55 @@ class HungarianPointLoss(nn.Module):
         avg_loss = total_loss / max(batch_size, 1)
         return avg_loss, match_info
 
+    def _grid_logits_to_points(self, grid_logits, top_k=4):
+        top_k = max(1, min(top_k, grid_logits.shape[-1]))
+        values, indices = torch.topk(grid_logits, k=top_k, dim=-1)
+        ys = torch.div(indices, self.grid_size, rounding_mode='floor')
+        xs = indices % self.grid_size
+        denom = float(max(self.grid_size - 1, 1))
+        points = torch.stack(
+            [xs.to(grid_logits.dtype) / denom, ys.to(grid_logits.dtype) / denom],
+            dim=-1
+        )
+        return points, values
+
+    def _grid_classification_loss(self, pred_grid_logits, grid_targets, gt_points_list=None, top_k=4):
+        pos_weight = pred_grid_logits.new_full((pred_grid_logits.shape[-1],), float(self.grid_pos_weight))
+        bce_loss = F.binary_cross_entropy_with_logits(
+            pred_grid_logits,
+            grid_targets,
+            pos_weight=pos_weight,
+            reduction='none'
+        )
+        sample_losses = bce_loss.mean(dim=-1)
+        total_loss = sample_losses.mean()
+
+        pred_points, pred_logits = self._grid_logits_to_points(pred_grid_logits, top_k=top_k)
+        pred_scores = torch.sigmoid(pred_logits)
+        match_info = []
+
+        if gt_points_list is None:
+            gt_points_list = [[] for _ in range(pred_grid_logits.shape[0])]
+
+        for batch_idx in range(pred_grid_logits.shape[0]):
+            gt_points = gt_points_list[batch_idx]
+            gt_tensor = torch.as_tensor(gt_points, dtype=pred_points.dtype) if gt_points else pred_points.new_zeros((0, 2))
+            min_grid_distance = None
+            if gt_tensor.numel() > 0:
+                min_grid_distance = torch.cdist(pred_points[batch_idx], gt_tensor, p=2).min().item()
+
+            match_info.append({
+                'pred_points': pred_points[batch_idx].detach().cpu().tolist(),
+                'pred_scores': pred_scores[batch_idx].detach().cpu().tolist(),
+                'gt_points': gt_points,
+                'sample_loss': float(sample_losses[batch_idx].detach().cpu()),
+                'coordinate_mode': 'normalized_grid',
+                'loss_type': 'bce_grid',
+                'min_grid_distance': min_grid_distance
+            })
+
+        return total_loss, match_info
+
     def _text_loss(self, pred_texts, gt_points_list, image_sizes):
         """
         前向传播，计算Hungarian Loss
@@ -396,7 +453,24 @@ class HungarianPointLoss(nn.Module):
         avg_loss = total_loss / batch_size
         return avg_loss, match_info
 
-    def forward(self, pred_texts=None, gt_points_list=None, image_sizes=None, pred_points=None, pred_logits=None):
+    def forward(
+        self,
+        pred_texts=None,
+        gt_points_list=None,
+        image_sizes=None,
+        pred_points=None,
+        pred_logits=None,
+        pred_grid_logits=None,
+        grid_targets=None,
+        top_k=4
+    ):
+        if pred_grid_logits is not None and grid_targets is not None:
+            return self._grid_classification_loss(
+                pred_grid_logits=pred_grid_logits,
+                grid_targets=grid_targets,
+                gt_points_list=gt_points_list,
+                top_k=top_k
+            )
         if pred_points is not None:
             return self._tensor_loss(pred_points, gt_points_list, image_sizes, pred_logits)
         return self._text_loss(pred_texts, gt_points_list, image_sizes)

@@ -4,10 +4,11 @@
 import os
 import sys
 import argparse
+import math
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torchvision import transforms
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from PIL import Image
@@ -16,7 +17,7 @@ from PIL import Image
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models.adapter import CoordinateAdapter, LightweightCoordinateAdapter
-from data.dataset import CoordinateDataset, collate_fn_pad_batch
+from data.dataset import CoordinateDataset, collate_fn_pad_batch, split_indices_by_image
 from loss.hungarian_loss import HungarianPointLoss
 from training.trainer import CoordinateAdapterTrainer, create_optimizer_and_scheduler
 from training.config import get_config, CONFIG_PRESETS
@@ -214,7 +215,9 @@ def create_adapter(config):
             num_heads=config.model.num_heads,
             num_grid_tokens=config.model.num_grid_tokens,
             num_output_points=config.model.num_output_points,
-            dropout=config.model.dropout
+            dropout=config.model.dropout,
+            output_mode=config.model.output_mode,
+            grid_size=config.model.grid_size
         )
     else:
         adapter = CoordinateAdapter(
@@ -224,7 +227,9 @@ def create_adapter(config):
             num_heads=config.model.num_heads,
             num_grid_tokens=config.model.num_grid_tokens,
             num_output_points=config.model.num_output_points,
-            dropout=config.model.dropout
+            dropout=config.model.dropout,
+            output_mode=config.model.output_mode,
+            grid_size=config.model.grid_size
         )
     
     return adapter
@@ -242,8 +247,7 @@ def create_dataloaders(config, train_transform, val_transform):
     Returns:
         train_dataloader, val_dataloader
     """
-    # 训练数据集
-    train_dataset = CoordinateDataset(
+    full_dataset = CoordinateDataset(
         data_root=config.data.data_root,
         annotation_file=config.data.annotation_file,
         image_dir=config.data.image_dir,
@@ -254,14 +258,46 @@ def create_dataloaders(config, train_transform, val_transform):
         transform=train_transform,
         num_output_points=config.model.num_output_points,
         target_point_strategy=config.data.target_point_strategy,
-        target_coordinate_mode=config.data.target_coordinate_mode
+        target_coordinate_mode=config.data.target_coordinate_mode,
+        output_mode=config.model.output_mode,
+        grid_size=config.model.grid_size,
+        neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+        relation_keywords=config.data.relation_keywords
     )
-    
-    # 验证数据集（如果有验证集）
+
+    train_dataset = full_dataset
     val_dataset = None
-    val_dataloader = None
-    
-    if os.path.exists(os.path.join(config.data.data_root, 'val_grefs_with_grids.json')):
+    sampler = None
+
+    if config.data.split_by_image:
+        train_indices, val_indices = split_indices_by_image(
+            full_dataset.samples,
+            val_ratio=config.data.val_ratio,
+            seed=config.seed
+        )
+        train_dataset = Subset(full_dataset, train_indices)
+
+        if val_indices:
+            val_base_dataset = CoordinateDataset(
+                data_root=config.data.data_root,
+                annotation_file=config.data.annotation_file,
+                image_dir=config.data.image_dir,
+                grid_image_dir=config.data.grid_image_dir,
+                tokenizer_path=config.model.qwen_model_path,
+                image_size=config.data.image_size,
+                max_length=config.data.max_length,
+                transform=val_transform,
+                num_output_points=config.model.num_output_points,
+                target_point_strategy=config.data.target_point_strategy,
+                target_coordinate_mode=config.data.target_coordinate_mode,
+                output_mode=config.model.output_mode,
+                grid_size=config.model.grid_size,
+                neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+                relation_keywords=config.data.relation_keywords
+            )
+            val_dataset = Subset(val_base_dataset, val_indices)
+
+    elif os.path.exists(os.path.join(config.data.data_root, 'val_grefs_with_grids.json')):
         val_dataset = CoordinateDataset(
             data_root=config.data.data_root,
             annotation_file='val_grefs_with_grids.json',
@@ -273,9 +309,48 @@ def create_dataloaders(config, train_transform, val_transform):
             transform=val_transform,
             num_output_points=config.model.num_output_points,
             target_point_strategy=config.data.target_point_strategy,
-            target_coordinate_mode=config.data.target_coordinate_mode
+            target_coordinate_mode=config.data.target_coordinate_mode,
+            output_mode=config.model.output_mode,
+            grid_size=config.model.grid_size,
+            neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+            relation_keywords=config.data.relation_keywords
         )
-        
+
+    if config.data.relation_query_oversample:
+        if isinstance(train_dataset, Subset):
+            base_dataset = train_dataset.dataset
+            weights = []
+            for subset_index in train_dataset.indices:
+                sample = base_dataset.samples[subset_index]
+                weights.append(2.5 if sample.get('query') and any(
+                    keyword in sample['query'].lower() for keyword in config.data.relation_keywords
+                ) else 1.0)
+        else:
+            weights = [
+                2.5 if sample.get('query') and any(
+                    keyword in sample['query'].lower() for keyword in config.data.relation_keywords
+                ) else 1.0
+                for sample in train_dataset.samples
+            ]
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(weights, dtype=torch.double),
+            num_samples=len(weights),
+            replacement=True
+        )
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=config.training.batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=collate_fn_pad_batch
+    )
+
+    val_dataloader = None
+    if val_dataset is not None:
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=config.training.batch_size,
@@ -284,18 +359,7 @@ def create_dataloaders(config, train_transform, val_transform):
             pin_memory=True,
             collate_fn=collate_fn_pad_batch
         )
-    
-    # 训练数据加载器
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True,
-        collate_fn=collate_fn_pad_batch
-    )
-    
+
     return train_dataloader, val_dataloader
 
 
@@ -380,6 +444,7 @@ def main():
     print(f"Adapter type: {config.model.adapter_type}")
     print(f"Grid feature dim: {config.model.grid_feature_dim}")
     print(f"Hidden dim: {config.model.hidden_dim}")
+    print(f"Output mode: {config.model.output_mode}")
     print(f"Batch size: {config.training.batch_size}")
     print(f"Learning rate: {config.training.lr}")
     print(f"Num epochs: {config.training.num_epochs}")
@@ -428,11 +493,19 @@ def main():
         inside_bbox_weight=config.training.inside_bbox_weight,
         outside_bbox_weight=config.training.outside_bbox_weight,
         match_cost=config.training.match_cost,
-        boundary_penalty_weight=config.training.boundary_penalty_weight
+        boundary_penalty_weight=config.training.boundary_penalty_weight,
+        loss_type=config.training.loss_type,
+        grid_size=config.model.grid_size,
+        grid_pos_weight=config.training.grid_pos_weight,
+        neighbor_soft_label_weight=config.training.neighbor_soft_label_weight
     )
     
     # 创建优化器和调度器
-    total_steps = len(train_dataloader) * config.training.num_epochs
+    optimizer_steps_per_epoch = max(
+        math.ceil(len(train_dataloader) / max(config.training.gradient_accumulation_steps, 1)),
+        1
+    )
+    total_steps = optimizer_steps_per_epoch * config.training.num_epochs
     train_config_dict = dict(config.training.__dict__)
     train_config_dict['total_steps'] = total_steps
 
@@ -456,7 +529,9 @@ def main():
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         log_interval=config.logging.log_interval,
         eval_interval=config.logging.eval_interval,
-        save_interval=config.logging.save_interval
+        save_interval=config.logging.save_interval,
+        loss_type=config.training.loss_type,
+        use_amp=config.training.use_amp
     )
     
     # 开始训练

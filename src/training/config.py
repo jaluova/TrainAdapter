@@ -42,6 +42,8 @@ class ModelConfig:
     qwen_model_path: str = field(default_factory=_default_model_path)
     freeze_qwen: bool = True
     num_output_points: int = 4
+    output_mode: str = 'grid_logits'  # 'grid_logits' or 'point_regression'
+    grid_size: int = 11
 
 
 @dataclass
@@ -63,6 +65,12 @@ class DataConfig:
     # 监督目标
     target_point_strategy: str = 'fps'
     target_coordinate_mode: str = 'normalized_grid'
+    split_by_image: bool = True
+    val_ratio: float = 0.2
+    relation_query_oversample: bool = True
+    relation_keywords: tuple = (
+        'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and'
+    )
     
     # 负样本
     use_negative_samples: bool = False
@@ -90,10 +98,14 @@ class TrainingConfig:
     scheduler_type: str = 'cosine'  # 'cosine' or 'linear'
     
     # Loss配置
+    loss_type: str = 'bce_grid'
     inside_bbox_weight: float = 1.0
     outside_bbox_weight: float = 0.1
     match_cost: str = 'euclidean'  # 'euclidean', 'l1', 'smooth_l1'
     boundary_penalty_weight: float = 0.1
+    grid_pos_weight: float = 4.0
+    neighbor_soft_label_weight: float = 0.3
+    use_amp: bool = True
 
 
 @dataclass
@@ -190,12 +202,33 @@ class Config:
 
 def get_default_config():
     """获取默认配置"""
-    return Config()
+    config = Config()
+    config.model.adapter_type = 'lightweight'
+    config.model.grid_feature_dim = 256
+    config.model.hidden_dim = 256
+    config.model.num_heads = 4
+    config.model.num_grid_tokens = 32
+    config.model.output_mode = 'grid_logits'
+
+    config.data.target_point_strategy = 'all'
+    config.data.split_by_image = True
+    config.data.val_ratio = 0.2
+    config.data.relation_query_oversample = True
+
+    config.training.batch_size = 4
+    config.training.gradient_accumulation_steps = 4
+    config.training.lr = 1e-4
+    config.training.num_epochs = 12
+    config.training.loss_type = 'bce_grid'
+    config.training.grid_pos_weight = 4.0
+    config.training.neighbor_soft_label_weight = 0.3
+    config.training.use_amp = True
+    return config
 
 
 def get_lightweight_config():
     """获取轻量级配置（适合资源受限场景）"""
-    config = Config()
+    config = get_default_config()
     
     # 模型配置
     config.model.adapter_type = 'lightweight'
@@ -204,17 +237,12 @@ def get_lightweight_config():
     config.model.num_heads = 4
     config.model.num_grid_tokens = 32
     
-    # 训练配置
-    config.training.batch_size = 16  # 更大的batch size
-    config.training.lr = 1e-4
-    config.training.gradient_accumulation_steps = 2
-    
     return config
 
 
 def get_high_performance_config():
     """获取高性能配置（追求最佳效果）"""
-    config = Config()
+    config = get_default_config()
     
     # 模型配置
     config.model.adapter_type = 'standard'

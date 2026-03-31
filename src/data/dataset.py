@@ -3,6 +3,7 @@
 """
 import json
 import os
+import random
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -11,6 +12,9 @@ from transformers import AutoTokenizer
 
 
 GRID_DIVISIONS = 10.0
+DEFAULT_RELATION_KEYWORDS = (
+    'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and'
+)
 
 
 def flatten_grid_points(grid_points):
@@ -36,6 +40,78 @@ def normalize_grid_points(grid_points, grid_divisions=GRID_DIVISIONS):
     for x, y in flatten_grid_points(grid_points):
         normalized.append([float(x) / float(grid_divisions), float(y) / float(grid_divisions)])
     return normalized
+
+
+def is_relation_query(query, relation_keywords=None):
+    keywords = relation_keywords or DEFAULT_RELATION_KEYWORDS
+    lowered = str(query).lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def build_grid_target(grid_points, grid_size=11, neighbor_soft_label_weight=0.3):
+    """
+    将离散网格点转换成 [grid_size * grid_size] 的 soft multi-hot 监督。
+    真值点为 1.0，8 邻域平滑为 neighbor_soft_label_weight。
+    """
+    target = torch.zeros(grid_size * grid_size, dtype=torch.float32)
+    discrete_points = flatten_grid_points(grid_points)
+
+    for point in discrete_points:
+        x = int(round(point[0]))
+        y = int(round(point[1]))
+        if not (0 <= x < grid_size and 0 <= y < grid_size):
+            continue
+
+        center_index = y * grid_size + x
+        target[center_index] = 1.0
+
+        if neighbor_soft_label_weight <= 0:
+            continue
+
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx = x + dx
+                ny = y + dy
+                if 0 <= nx < grid_size and 0 <= ny < grid_size:
+                    neighbor_index = ny * grid_size + nx
+                    target[neighbor_index] = max(
+                        target[neighbor_index].item(),
+                        float(neighbor_soft_label_weight)
+                    )
+
+    return target
+
+
+def split_indices_by_image(samples, val_ratio=0.2, seed=42):
+    """
+    按图片级切分，避免同图不同 query 同时落到 train/val。
+    """
+    image_to_indices = {}
+    for idx, sample in enumerate(samples):
+        image_to_indices.setdefault(sample['image_id'], []).append(idx)
+
+    image_ids = sorted(image_to_indices.keys())
+    rng = random.Random(seed)
+    rng.shuffle(image_ids)
+
+    if len(image_ids) <= 1:
+        return list(range(len(samples))), []
+
+    val_count = max(1, int(round(len(image_ids) * float(val_ratio))))
+    val_count = min(val_count, len(image_ids) - 1)
+    val_images = set(image_ids[:val_count])
+
+    train_indices = []
+    val_indices = []
+    for image_id, indices in image_to_indices.items():
+        if image_id in val_images:
+            val_indices.extend(indices)
+        else:
+            train_indices.extend(indices)
+
+    return sorted(train_indices), sorted(val_indices)
 
 
 def sample_farthest_points(points, max_points):
@@ -117,9 +193,15 @@ def collate_fn_pad_batch(batch):
     input_ids = torch.stack([item['input_ids'] for item in batch])
     attention_mask = torch.stack([item['attention_mask'] for item in batch])
     gt_points = [item['gt_points'] for item in batch]
+    grid_targets = torch.stack([item['grid_target'] for item in batch])
     image_sizes = [item['image_size'] for item in batch]
     queries = [item['query'] for item in batch]
     instructions = [item['instruction'] for item in batch]
+    relation_flags = torch.tensor(
+        [1 if item.get('is_relation_query', False) else 0 for item in batch],
+        dtype=torch.bool
+    )
+    image_ids = [item.get('image_id', '') for item in batch]
     
     images = [item['image'] for item in batch]
     grid_images = [item['grid_image'] for item in batch]
@@ -153,9 +235,12 @@ def collate_fn_pad_batch(batch):
         'input_ids': input_ids,
         'attention_mask': attention_mask,
         'gt_points': gt_points,
+        'grid_target': grid_targets,
         'image_size': image_sizes,
         'query': queries,
-        'instruction': instructions
+        'instruction': instructions,
+        'is_relation_query': relation_flags,
+        'image_id': image_ids
     }
 
 
@@ -174,7 +259,11 @@ class CoordinateDataset(Dataset):
                  transform=None,
                  num_output_points=4,
                  target_point_strategy='fps',
-                 target_coordinate_mode='normalized_grid'):
+                 target_coordinate_mode='normalized_grid',
+                 output_mode='grid_logits',
+                 grid_size=11,
+                 neighbor_soft_label_weight=0.3,
+                 relation_keywords=None):
         """
         Args:
             data_root: 数据根目录
@@ -195,6 +284,10 @@ class CoordinateDataset(Dataset):
         self.num_output_points = num_output_points
         self.target_point_strategy = target_point_strategy
         self.target_coordinate_mode = target_coordinate_mode
+        self.output_mode = output_mode
+        self.grid_size = grid_size
+        self.neighbor_soft_label_weight = neighbor_soft_label_weight
+        self.relation_keywords = tuple(relation_keywords or DEFAULT_RELATION_KEYWORDS)
         
         # 加载分词器
         self.tokenizer = self._load_tokenizer(tokenizer_path)
@@ -280,8 +373,6 @@ class CoordinateDataset(Dataset):
             f"请识别'{query}'在网格坐标系中的位置，输出格式[x,y]。"
         ]
         
-        # 随机选择一个模板（训练时）
-        import random
         template = random.choice(instruction_templates)
         
         return template
@@ -376,16 +467,29 @@ class CoordinateDataset(Dataset):
             image_width, image_height = img.size
         
         # 6. 构建输出
+        normalized_all_points = normalize_grid_points(sample['grid_points'])
+        if self.output_mode == 'grid_logits':
+            gt_points = normalized_all_points
+        else:
+            gt_points = self._normalize_grid_points(sample['grid_points'])
+
         data = {
             'image': image,
             'grid_image': grid_image,
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'gt_points': self._normalize_grid_points(sample['grid_points']),
+            'gt_points': gt_points,
+            'grid_target': build_grid_target(
+                sample['grid_points'],
+                grid_size=self.grid_size,
+                neighbor_soft_label_weight=self.neighbor_soft_label_weight
+            ),
             'image_size': (image_width, image_height),
             'query': sample['query'],
             'instruction': instruction,
-            'target_coordinate_mode': self.target_coordinate_mode
+            'target_coordinate_mode': self.target_coordinate_mode,
+            'is_relation_query': is_relation_query(sample['query'], self.relation_keywords),
+            'image_id': sample['image_id']
         }
         
         return data
@@ -407,6 +511,10 @@ class CoordinateDatasetV2(Dataset):
                  num_output_points=4,
                  target_point_strategy='fps',
                  target_coordinate_mode='normalized_grid',
+                 output_mode='grid_logits',
+                 grid_size=11,
+                 neighbor_soft_label_weight=0.3,
+                 relation_keywords=None,
                  use_negative_samples=True,
                  negative_sample_ratio=0.2):
         """
@@ -423,6 +531,10 @@ class CoordinateDatasetV2(Dataset):
         self.num_output_points = num_output_points
         self.target_point_strategy = target_point_strategy
         self.target_coordinate_mode = target_coordinate_mode
+        self.output_mode = output_mode
+        self.grid_size = grid_size
+        self.neighbor_soft_label_weight = neighbor_soft_label_weight
+        self.relation_keywords = tuple(relation_keywords or DEFAULT_RELATION_KEYWORDS)
         self.use_negative_samples = use_negative_samples
         self.negative_sample_ratio = negative_sample_ratio
         
@@ -548,11 +660,18 @@ class CoordinateDatasetV2(Dataset):
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'gt_points': CoordinateDataset._normalize_grid_points(self, sample['grid_points']),
+            'grid_target': build_grid_target(
+                sample['grid_points'],
+                grid_size=self.grid_size,
+                neighbor_soft_label_weight=self.neighbor_soft_label_weight
+            ),
             'image_size': (image_width, image_height),
             'query': sample['query'],
             'instruction': instruction,
             'has_target': sample['has_target'],
-            'target_coordinate_mode': self.target_coordinate_mode
+            'target_coordinate_mode': self.target_coordinate_mode,
+            'is_relation_query': is_relation_query(sample['query'], self.relation_keywords),
+            'image_id': sample['image_id']
         }
         
         return data

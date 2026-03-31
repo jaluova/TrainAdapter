@@ -1,79 +1,105 @@
 """
 Coordinate Adapter: 主适配器模块
-整合GridEncoder、CrossAttention、GatedFusion和ResidualFFN
+整合 GridEncoder、CrossAttention、GatedFusion 和任务头。
 """
 import torch
 import torch.nn as nn
+
 from .grid_encoder import GridEncoder, FeatureProjector
 from .cross_attention import CrossAttention, GatedFusion, ResidualFFN
 
 
-class CoordinateAdapter(nn.Module):
+class AttentionPool(nn.Module):
+    """对 token 序列做可学习 attention pooling。"""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.score_proj = nn.Linear(dim, 1)
+
+    def forward(self, features, attention_mask=None):
+        scores = self.score_proj(features).squeeze(-1)
+        if attention_mask is not None:
+            mask = attention_mask.to(dtype=torch.bool)
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+
+        weights = torch.softmax(scores, dim=-1)
+        return torch.sum(features * weights.unsqueeze(-1), dim=1)
+
+
+class BaseCoordinateAdapter(nn.Module):
     """
-    Coordinate Adapter主模块
-    输入: 原始图像和网格图像
-    输出: 增强的视觉特征
+    Coordinate Adapter 基类。
+    主干负责网格引导的视觉增强；任务头支持 grid logits 和旧点回归两种模式。
     """
-    def __init__(self, 
-                 visual_dim=768,
-                 grid_feature_dim=512,
-                 hidden_dim=512,
-                 num_heads=8,
-                 num_grid_tokens=64,
-                 num_output_points=4,
-                 dropout=0.1):
-        super(CoordinateAdapter, self).__init__()
-        
+
+    def __init__(
+        self,
+        visual_dim=768,
+        grid_feature_dim=512,
+        hidden_dim=512,
+        num_heads=8,
+        num_grid_tokens=64,
+        num_output_points=4,
+        dropout=0.1,
+        output_mode='grid_logits',
+        grid_size=11,
+        ffn_hidden_multiplier=4
+    ):
+        super().__init__()
+
         self.visual_dim = visual_dim
         self.hidden_dim = hidden_dim
         self.num_output_points = num_output_points
-        
-        # 1. Grid Encoder: 从网格图像提取特征
+        self.output_mode = output_mode
+        self.grid_size = grid_size
+        self.num_grid_logits = grid_size * grid_size
+
         self.grid_encoder = GridEncoder(
             input_channels=3,
             feature_dim=grid_feature_dim
         )
-        
-        # 2. Feature Projector: 投影网格特征到与视觉特征相同维度
         self.grid_projector = FeatureProjector(
             input_dim=grid_feature_dim,
             output_dim=visual_dim,
             num_tokens=num_grid_tokens
         )
-        
-        # 3. Cross Attention: 网格特征指导视觉特征增强
         self.cross_attention = CrossAttention(
             dim=visual_dim,
             num_heads=num_heads,
             dropout=dropout
         )
-        
-        # 4. Gated Fusion: 自适应融合原始特征和增强特征
         self.gated_fusion = GatedFusion(
             dim=visual_dim,
             dropout=dropout
         )
-        
-        # 5. Residual FFN: 残差前馈网络进一步处理
         self.residual_ffn = ResidualFFN(
             dim=visual_dim,
-            hidden_dim=hidden_dim * 4,
+            hidden_dim=hidden_dim * ffn_hidden_multiplier,
             dropout=dropout
         )
 
-        # 6. Point head: 从融合后的视觉特征和文本特征中直接预测坐标
+        self.text_pool = AttentionPool(visual_dim)
+        self.visual_condition_proj = nn.Linear(visual_dim, visual_dim)
+        self.text_condition_proj = nn.Linear(visual_dim, visual_dim)
+        self.token_score = nn.Linear(visual_dim, 1)
+        self.grid_classifier = nn.Sequential(
+            nn.LayerNorm(visual_dim),
+            nn.Linear(visual_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.num_grid_logits)
+        )
+
         self.point_head = nn.Sequential(
             nn.Linear(visual_dim * 2, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_output_points * 3)
         )
-        
-        # 初始化权重
+
         self._initialize_weights()
-    
+
     def _initialize_weights(self):
-        """初始化权重"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -82,64 +108,63 @@ class CoordinateAdapter(nn.Module):
             elif isinstance(module, nn.LayerNorm):
                 nn.init.constant_(module.weight, 1.0)
                 nn.init.constant_(module.bias, 0)
-    
+
     def forward(self, images, grid_images, visual_features):
-        """
-        前向传播
-        
-        Args:
-            images: 原始图像 [B, 3, H, W] (备用，可用于后续扩展)
-            grid_images: 网格图像 [B, 3, H, W]
-            visual_features: Qwen2.5-VL视觉编码器输出的视觉特征 [B, N, D]
-            
-        Returns:
-            增强的视觉特征 [B, N, D]
-        """
-        B, N, D = visual_features.shape
-        
-        # 1. 提取网格特征
-        # [B, 3, H, W] -> [B, grid_feature_dim, h, w]
         grid_features_map = self.grid_encoder(grid_images)
-        
-        # 2. 投影网格特征到token序列
-        # [B, grid_feature_dim, h, w] -> [B, num_grid_tokens, visual_dim]
         grid_tokens = self.grid_projector(grid_features_map)
-        
-        # 3. Cross Attention: 网格特征指导视觉特征增强
-        # visual_features [B, N, D] + grid_tokens [B, M, D] -> enhanced_features [B, N, D]
         enhanced_features = self.cross_attention(
             visual_features=visual_features,
             grid_features=grid_tokens
         )
-        
-        # 4. Gated Fusion: 自适应融合原始特征和增强特征
-        # visual_features [B, N, D] + enhanced_features [B, N, D] -> fused_features [B, N, D]
         fused_features = self.gated_fusion(visual_features, enhanced_features)
-        
-        # 5. Residual FFN: 进一步处理融合特征
-        # fused_features [B, N, D] -> final_features [B, N, D]
-        final_features = self.residual_ffn(fused_features)
-        
-        return final_features
+        return self.residual_ffn(fused_features)
 
-    def predict_points(self, visual_features, text_features=None):
-        """
-        基于增强后的视觉特征预测坐标点和置信度
-
-        Args:
-            visual_features: [B, N, D]
-            text_features: [B, L, D] or None
-
-        Returns:
-            pred_points: [B, K, 2]，归一化到[0, 1]
-            pred_logits: [B, K]
-        """
-        visual_summary = visual_features.mean(dim=1)
-
+    def _pool_text_features(self, text_features=None, attention_mask=None, visual_summary=None):
         if text_features is None:
-            text_summary = torch.zeros_like(visual_summary)
-        else:
-            text_summary = text_features.mean(dim=1)
+            if visual_summary is None:
+                raise ValueError("visual_summary is required when text_features is None")
+            return torch.zeros_like(visual_summary)
+        return self.text_pool(text_features, attention_mask=attention_mask)
+
+    def predict_grid_logits(self, visual_features, text_features=None, attention_mask=None):
+        visual_summary = visual_features.mean(dim=1)
+        text_summary = self._pool_text_features(
+            text_features=text_features,
+            attention_mask=attention_mask,
+            visual_summary=visual_summary
+        )
+
+        conditioned_tokens = torch.gelu(
+            self.visual_condition_proj(visual_features) +
+            self.text_condition_proj(text_summary).unsqueeze(1)
+        )
+        token_logits = self.grid_classifier(conditioned_tokens)
+        token_weights = torch.softmax(self.token_score(conditioned_tokens).squeeze(-1), dim=1)
+        grid_logits = torch.sum(token_logits * token_weights.unsqueeze(-1), dim=1)
+        return grid_logits
+
+    def decode_grid_logits(self, grid_logits, top_k=None):
+        top_k = top_k or self.num_output_points
+        top_k = max(1, min(top_k, self.num_grid_logits))
+
+        values, indices = torch.topk(grid_logits, k=top_k, dim=-1)
+        ys = torch.div(indices, self.grid_size, rounding_mode='floor')
+        xs = indices % self.grid_size
+
+        denom = float(max(self.grid_size - 1, 1))
+        points = torch.stack(
+            [xs.to(grid_logits.dtype) / denom, ys.to(grid_logits.dtype) / denom],
+            dim=-1
+        )
+        return points, values
+
+    def predict_point_regression(self, visual_features, text_features=None, attention_mask=None):
+        visual_summary = visual_features.mean(dim=1)
+        text_summary = self._pool_text_features(
+            text_features=text_features,
+            attention_mask=attention_mask,
+            visual_summary=visual_summary
+        )
 
         fused_summary = torch.cat([visual_summary, text_summary], dim=-1)
         raw_outputs = self.point_head(fused_summary)
@@ -148,107 +173,21 @@ class CoordinateAdapter(nn.Module):
         pred_points = torch.sigmoid(raw_outputs[..., :2])
         pred_logits = raw_outputs[..., 2]
         return pred_points, pred_logits
-    
-    def get_trainable_parameters(self):
-        """
-        获取可训练参数（用于优化器）
-        返回所有Adapter参数的列表
-        """
-        return list(self.parameters())
-    
-    def get_parameter_count(self):
-        """获取参数数量"""
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return {
-            'total': total_params,
-            'trainable': trainable_params
-        }
 
+    def predict_points(self, visual_features, text_features=None, attention_mask=None):
+        if self.output_mode == 'grid_logits':
+            grid_logits = self.predict_grid_logits(
+                visual_features,
+                text_features=text_features,
+                attention_mask=attention_mask
+            )
+            return self.decode_grid_logits(grid_logits, top_k=self.num_output_points)
 
-class LightweightCoordinateAdapter(nn.Module):
-    """
-    轻量级Coordinate Adapter
-    减少参数数量，适合资源受限场景
-    """
-    def __init__(self, 
-                 visual_dim=768,
-                 grid_feature_dim=256,
-                 hidden_dim=256,
-                 num_heads=4,
-                 num_grid_tokens=32,
-                 num_output_points=4,
-                 dropout=0.1):
-        super(LightweightCoordinateAdapter, self).__init__()
-        
-        self.visual_dim = visual_dim
-        self.hidden_dim = hidden_dim
-        self.num_output_points = num_output_points
-        
-        # 1. 轻量级Grid Encoder
-        self.grid_encoder = GridEncoder(
-            input_channels=3,
-            feature_dim=grid_feature_dim
+        return self.predict_point_regression(
+            visual_features,
+            text_features=text_features,
+            attention_mask=attention_mask
         )
-        
-        # 2. 特征投影
-        self.grid_projector = FeatureProjector(
-            input_dim=grid_feature_dim,
-            output_dim=visual_dim,
-            num_tokens=num_grid_tokens
-        )
-        
-        # 3. 轻量级Cross Attention
-        self.cross_attention = CrossAttention(
-            dim=visual_dim,
-            num_heads=num_heads,
-            dropout=dropout
-        )
-        
-        # 4. 简化的Gated Fusion
-        self.gated_fusion = GatedFusion(
-            dim=visual_dim,
-            dropout=dropout
-        )
-        
-        # 5. 轻量级Residual FFN
-        self.residual_ffn = ResidualFFN(
-            dim=visual_dim,
-            hidden_dim=hidden_dim * 2,  # 减小隐藏层维度
-            dropout=dropout
-        )
-
-        self.point_head = nn.Sequential(
-            nn.Linear(visual_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_output_points * 3)
-        )
-        
-    def forward(self, images, grid_images, visual_features):
-        """前向传播（同CoordinateAdapter）"""
-        grid_features_map = self.grid_encoder(grid_images)
-        grid_tokens = self.grid_projector(grid_features_map)
-        enhanced_features = self.cross_attention(visual_features, grid_tokens)
-        fused_features = self.gated_fusion(visual_features, enhanced_features)
-        final_features = self.residual_ffn(fused_features)
-        return final_features
-
-    def predict_points(self, visual_features, text_features=None):
-        visual_summary = visual_features.mean(dim=1)
-
-        if text_features is None:
-            text_summary = torch.zeros_like(visual_summary)
-        else:
-            text_summary = text_features.mean(dim=1)
-
-        fused_summary = torch.cat([visual_summary, text_summary], dim=-1)
-        raw_outputs = self.point_head(fused_summary)
-        raw_outputs = raw_outputs.view(-1, self.num_output_points, 3)
-
-        pred_points = torch.sigmoid(raw_outputs[..., :2])
-        pred_logits = raw_outputs[..., 2]
-        return pred_points, pred_logits
 
     def get_trainable_parameters(self):
         return list(self.parameters())
@@ -262,47 +201,83 @@ class LightweightCoordinateAdapter(nn.Module):
         }
 
 
-if __name__ == "__main__":
-    import torch
-    
-    # 测试代码
-    print("=== 测试CoordinateAdapter ===")
-    
-    # 模拟输入
-    B, C, H, W = 2, 3, 448, 448
-    N, D = 196, 768  # Qwen2.5-VL视觉特征: 14x14=196 tokens, 每个token 768维
-    
-    images = torch.randn(B, C, H, W)
-    grid_images = torch.randn(B, C, H, W)
-    visual_features = torch.randn(B, N, D)
-    
-    # 创建Adapter
-    adapter = CoordinateAdapter(
+class CoordinateAdapter(BaseCoordinateAdapter):
+    """标准版 Coordinate Adapter。"""
+
+    def __init__(
+        self,
         visual_dim=768,
         grid_feature_dim=512,
         hidden_dim=512,
         num_heads=8,
         num_grid_tokens=64,
-        dropout=0.1
-    )
-    
-    # 前向传播
+        num_output_points=4,
+        dropout=0.1,
+        output_mode='grid_logits',
+        grid_size=11
+    ):
+        super().__init__(
+            visual_dim=visual_dim,
+            grid_feature_dim=grid_feature_dim,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            num_grid_tokens=num_grid_tokens,
+            num_output_points=num_output_points,
+            dropout=dropout,
+            output_mode=output_mode,
+            grid_size=grid_size,
+            ffn_hidden_multiplier=4
+        )
+
+
+class LightweightCoordinateAdapter(BaseCoordinateAdapter):
+    """轻量级 Coordinate Adapter。"""
+
+    def __init__(
+        self,
+        visual_dim=768,
+        grid_feature_dim=256,
+        hidden_dim=256,
+        num_heads=4,
+        num_grid_tokens=32,
+        num_output_points=4,
+        dropout=0.1,
+        output_mode='grid_logits',
+        grid_size=11
+    ):
+        super().__init__(
+            visual_dim=visual_dim,
+            grid_feature_dim=grid_feature_dim,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            num_grid_tokens=num_grid_tokens,
+            num_output_points=num_output_points,
+            dropout=dropout,
+            output_mode=output_mode,
+            grid_size=grid_size,
+            ffn_hidden_multiplier=2
+        )
+
+
+if __name__ == "__main__":
+    print("=== 测试CoordinateAdapter ===")
+
+    B, C, H, W = 2, 3, 448, 448
+    N, D = 196, 768
+    L = 16
+
+    images = torch.randn(B, C, H, W)
+    grid_images = torch.randn(B, C, H, W)
+    visual_features = torch.randn(B, N, D)
+    text_features = torch.randn(B, L, D)
+    attention_mask = torch.ones(B, L, dtype=torch.long)
+
+    adapter = CoordinateAdapter(output_mode='grid_logits')
     output_features = adapter(images, grid_images, visual_features)
-    
-    print(f"Input visual features shape: {visual_features.shape}")
+    grid_logits = adapter.predict_grid_logits(output_features, text_features, attention_mask)
+    pred_points, pred_logits = adapter.predict_points(output_features, text_features, attention_mask)
+
     print(f"Output features shape: {output_features.shape}")
-    
-    # 参数统计
-    param_count = adapter.get_parameter_count()
-    print(f"Total parameters: {param_count['total']:,}")
-    print(f"Trainable parameters: {param_count['trainable']:,}")
-    
-    # 测试轻量级版本
-    print("\n=== 测试LightweightCoordinateAdapter ===")
-    lightweight_adapter = LightweightCoordinateAdapter()
-    lightweight_output = lightweight_adapter(images, grid_images, visual_features)
-    print(f"Lightweight output shape: {lightweight_output.shape}")
-    
-    lightweight_param_count = lightweight_adapter.get_parameter_count()
-    print(f"Lightweight total parameters: {lightweight_param_count['total']:,}")
-    print(f"Lightweight trainable parameters: {lightweight_param_count['trainable']:,}")
+    print(f"Grid logits shape: {grid_logits.shape}")
+    print(f"Decoded points shape: {pred_points.shape}")
+    print(f"Decoded logits shape: {pred_logits.shape}")
