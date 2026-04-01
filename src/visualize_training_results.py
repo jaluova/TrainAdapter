@@ -42,6 +42,11 @@ def parse_args():
     parser.add_argument("--query_contains", type=str, default=None, help="Only keep samples whose query contains this text")
     parser.add_argument("--seed", type=int, default=42, help="Seed for deterministic sample picking")
     parser.add_argument("--top_k", type=int, default=4, help="How many predicted points to draw")
+    parser.add_argument("--dynamic_topk", action="store_true", help="Use dynamic top-k point selection for visualization")
+    parser.add_argument("--dynamic_abs_threshold", type=float, default=0.35, help="Absolute sigmoid threshold for dynamic top-k")
+    parser.add_argument("--dynamic_rel_ratio", type=float, default=0.75, help="Relative threshold ratio against top-1 score")
+    parser.add_argument("--dynamic_min_k", type=int, default=1, help="Minimum selected points in dynamic top-k mode")
+    parser.add_argument("--dynamic_max_k", type=int, default=6, help="Maximum selected points in dynamic top-k mode")
     return parser.parse_args()
 
 
@@ -155,12 +160,13 @@ def load_adapter_checkpoint(adapter, checkpoint_path, device):
     return checkpoint
 
 
-def run_prediction(adapter, qwen_model, batch, device, top_k):
+def run_prediction(adapter, qwen_model, batch, device, top_k, dynamic_topk=False, dynamic_topk_params=None):
     images = batch["image"].to(device)
     grid_images = batch["grid_image"].to(device)
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     adapter_dtype = next(adapter.parameters()).dtype
+    dynamic_topk_params = dynamic_topk_params or {}
 
     with torch.no_grad():
         visual_features = qwen_model.encode_image(images)
@@ -179,18 +185,59 @@ def run_prediction(adapter, qwen_model, batch, device, top_k):
                 text_features=text_embeddings,
                 attention_mask=attention_mask
             )
-            pred_points, pred_logits = adapter.decode_grid_logits(
+            candidate_points, candidate_logits = adapter.decode_grid_logits(
                 pred_grid_logits,
-                top_k=max(1, top_k)
+                top_k=adapter.num_grid_logits
             )
+            if dynamic_topk:
+                selected = adapter.select_dynamic_topk(
+                    candidate_points[0],
+                    candidate_logits[0],
+                    abs_threshold=dynamic_topk_params.get("abs_threshold", 0.35),
+                    rel_ratio=dynamic_topk_params.get("rel_ratio", 0.75),
+                    min_k=dynamic_topk_params.get("min_k", 1),
+                    max_k=dynamic_topk_params.get("max_k", 6)
+                )
+                pred_points = selected["selected_points"].detach().cpu()
+                pred_logits = selected["selected_logits"].detach().cpu()
+                selection_meta = {
+                    "selection_mode": "dynamic_topk",
+                    "selected_k": selected["selected_k"],
+                    "selected_indices": selected["selected_indices"].detach().cpu().tolist(),
+                    "selected_scores": [float(x) for x in selected["selected_scores"].detach().cpu().tolist()],
+                    "candidate_scores": [float(x) for x in selected["candidate_scores"].detach().cpu().tolist()],
+                    "dynamic_topk_params": {
+                        "abs_threshold": float(dynamic_topk_params.get("abs_threshold", 0.35)),
+                        "rel_ratio": float(dynamic_topk_params.get("rel_ratio", 0.75)),
+                        "min_k": int(dynamic_topk_params.get("min_k", 1)),
+                        "max_k": int(dynamic_topk_params.get("max_k", 6)),
+                    }
+                }
+                return pred_points, pred_logits, selection_meta
+
+            pred_points = candidate_points[0].detach().cpu()
+            pred_logits = candidate_logits[0].detach().cpu()
         else:
             pred_points, pred_logits = adapter.predict_point_regression(
                 enhanced_features,
                 text_features=text_embeddings,
                 attention_mask=attention_mask
             )
+            pred_points = pred_points[0].detach().cpu()
+            pred_logits = pred_logits[0].detach().cpu()
 
-    return pred_points[0].detach().cpu(), pred_logits[0].detach().cpu()
+    scores = torch.sigmoid(pred_logits)
+    ranked_indices = torch.argsort(scores, descending=True)
+    fixed_k = max(1, min(int(top_k), len(ranked_indices)))
+    selection_meta = {
+        "selection_mode": "fixed_topk",
+        "selected_k": fixed_k,
+        "selected_indices": ranked_indices[:fixed_k].tolist(),
+        "selected_scores": [float(x) for x in scores[ranked_indices[:fixed_k]].tolist()],
+        "candidate_scores": [float(x) for x in scores[ranked_indices].tolist()],
+        "dynamic_topk_params": None,
+    }
+    return pred_points, pred_logits, selection_meta
 
 
 def normalized_points_to_pixels(points, image_size):
@@ -246,12 +293,13 @@ def wrap_text(text, width=42):
     return lines
 
 
-def render_visual(sample, pred_points, pred_logits, output_path, top_k):
+def render_visual(sample, pred_points, pred_logits, output_path, top_k, selection_meta=None):
     image_id = sample["image_id"]
     query = sample["query"]
     gt_grid_points = sample["gt_points"]
     image_size = sample["image_size"]
     data_root = sample["data_root"]
+    selection_meta = selection_meta or {}
 
     original_path = os.path.join(data_root, "images", image_id)
     grid_path = os.path.join(data_root, "grid_images", os.path.basename(sample.get("grid_image_path", image_id)))
@@ -269,6 +317,8 @@ def render_visual(sample, pred_points, pred_logits, output_path, top_k):
         key=lambda item: item[1][1],
         reverse=True
     )[:max(1, top_k)]
+    selected_k = int(selection_meta.get("selected_k", len(ranked)))
+    selection_mode = selection_meta.get("selection_mode", "fixed_topk")
 
     pred_norm_points = [item[1][0] for item in ranked]
     pred_scores = [item[1][1] for item in ranked]
@@ -277,7 +327,7 @@ def render_visual(sample, pred_points, pred_logits, output_path, top_k):
 
     panel_gap = 30
     header_h = 150
-    footer_h = 170
+    footer_h = 210
     canvas_w = original_img.width + grid_img.width + panel_gap * 3
     canvas_h = max(original_img.height, grid_img.height) + header_h + footer_h
 
@@ -338,12 +388,27 @@ def render_visual(sample, pred_points, pred_logits, output_path, top_k):
         width=2
     )
     overlay.text((50, legend_y + 18), "How To Read This Figure", fill="#162033", font=body_font)
-    legend_lines = [
-        "Blue filled dots (G1, G2...) are normalized supervision points sampled from the gRefCOCO target region.",
-        "Red circles (P1, P2...) are the adapter's top predicted points ranked by sigmoid confidence.",
-        "If red circles gather around the blue cluster, the model has learned to align text with the target region.",
-        "Training, evaluation, and these overlays all use the same normalized grid coordinate system."
-    ]
+    if selection_mode == "dynamic_topk":
+        dynamic_params = selection_meta.get("dynamic_topk_params") or {}
+        legend_lines = [
+            "Blue filled dots (G1, G2...) are normalized supervision points sampled from the gRefCOCO target region.",
+            f"Red circles are dynamic top-k predictions; this sample selected {selected_k} point(s).",
+            (
+                "Dynamic rule: keep points with score >= max("
+                f"{dynamic_params.get('abs_threshold', 0.35):.2f}, "
+                f"{dynamic_params.get('rel_ratio', 0.75):.2f} * top1_score)"
+                f", then clamp to [{dynamic_params.get('min_k', 1)}, {dynamic_params.get('max_k', 6)}]."
+            ),
+            "Main evaluation still uses fixed Top1 / Top4; dynamic top-k is only for qualitative visualization.",
+            "Training, evaluation, and these overlays all use the same normalized grid coordinate system."
+        ]
+    else:
+        legend_lines = [
+            "Blue filled dots (G1, G2...) are normalized supervision points sampled from the gRefCOCO target region.",
+            "Red circles (P1, P2...) are the adapter's top predicted points ranked by sigmoid confidence.",
+            "If red circles gather around the blue cluster, the model has learned to align text with the target region.",
+            "Training, evaluation, and these overlays all use the same normalized grid coordinate system."
+        ]
     text_y = legend_y + 52
     for line in legend_lines:
         overlay.text((50, text_y), line, fill="#334155", font=small_font)
@@ -359,7 +424,14 @@ def render_visual(sample, pred_points, pred_logits, output_path, top_k):
         "ground_truth_pixel_points": [[round(x, 2), round(y, 2)] for x, y in gt_pixel_points],
         "predicted_points_normalized": [[round(float(x), 4), round(float(y), 4)] for x, y in pred_norm_points],
         "predicted_points_on_grid_image": [[round(x, 2), round(y, 2)] for x, y in pred_pixel_points],
-        "prediction_scores": [round(float(score), 4) for score in pred_scores]
+        "prediction_scores": [round(float(score), 4) for score in pred_scores],
+        "selection_mode": selection_mode,
+        "selected_k": selected_k,
+        "dynamic_topk_params": selection_meta.get("dynamic_topk_params"),
+        "selected_indices": selection_meta.get("selected_indices"),
+        "selected_scores": [round(float(score), 4) for score in selection_meta.get("selected_scores", pred_scores)],
+        "candidate_scores": [round(float(score), 4) for score in selection_meta.get("candidate_scores", scores)],
+        "selected_points_normalized": [[round(float(x), 4), round(float(y), 4)] for x, y in pred_norm_points]
     }
     with open(str(Path(output_path).with_suffix(".json")), "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -370,7 +442,10 @@ def main():
     torch.manual_seed(args.seed)
 
     config = load_config(args)
-    output_dir = Path(args.output_dir)
+    output_dir_arg = args.output_dir
+    if args.dynamic_topk and output_dir_arg == "visualizations/qualitative":
+        output_dir_arg = "visualizations/qualitative_dynamic_topk"
+    output_dir = Path(output_dir_arg)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
@@ -398,13 +473,33 @@ def main():
         "device": str(device),
         "checkpoint_step": checkpoint_meta.get("step") if isinstance(checkpoint_meta, dict) else None,
         "checkpoint_loss": checkpoint_meta.get("loss") if isinstance(checkpoint_meta, dict) else None,
+        "selection_mode": "dynamic_topk" if args.dynamic_topk else "fixed_topk",
+        "dynamic_topk_params": {
+            "abs_threshold": args.dynamic_abs_threshold,
+            "rel_ratio": args.dynamic_rel_ratio,
+            "min_k": args.dynamic_min_k,
+            "max_k": args.dynamic_max_k,
+        } if args.dynamic_topk else None,
     }
 
     for sample_idx in chosen_indices:
         item = dataset[sample_idx]
         sample_meta = dict(dataset.samples[sample_idx])
         batch = collate_fn_pad_batch([item])
-        pred_points, pred_logits = run_prediction(adapter, qwen_model, batch, device, args.top_k)
+        pred_points, pred_logits, selection_meta = run_prediction(
+            adapter,
+            qwen_model,
+            batch,
+            device,
+            args.top_k,
+            dynamic_topk=args.dynamic_topk,
+            dynamic_topk_params={
+                "abs_threshold": args.dynamic_abs_threshold,
+                "rel_ratio": args.dynamic_rel_ratio,
+                "min_k": args.dynamic_min_k,
+                "max_k": args.dynamic_max_k,
+            }
+        )
         render_item = {
             "image_id": sample_meta["image_id"],
             "query": item["query"],
@@ -414,7 +509,15 @@ def main():
             "grid_image_path": sample_meta.get("grid_image_path", sample_meta["image_id"]),
         }
         output_path = output_dir / f"sample_{sample_idx:04d}_{sample_meta['image_id']}"
-        render_visual(render_item, pred_points, pred_logits, str(output_path.with_suffix(".png")), args.top_k)
+        display_top_k = selection_meta.get("selected_k", args.top_k) if args.dynamic_topk else args.top_k
+        render_visual(
+            render_item,
+            pred_points,
+            pred_logits,
+            str(output_path.with_suffix(".png")),
+            display_top_k,
+            selection_meta=selection_meta
+        )
 
     with open(output_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)

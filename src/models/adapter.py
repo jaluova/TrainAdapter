@@ -159,6 +159,109 @@ class BaseCoordinateAdapter(nn.Module):
         )
         return points, values
 
+    @staticmethod
+    def select_dynamic_topk(
+        pred_points,
+        pred_logits,
+        abs_threshold=0.35,
+        rel_ratio=0.75,
+        min_k=1,
+        max_k=6
+    ):
+        if pred_logits.ndim != 1:
+            raise ValueError("pred_logits must be a 1D tensor")
+        if pred_points.ndim != 2:
+            raise ValueError("pred_points must be a 2D tensor")
+        if pred_points.shape[0] != pred_logits.shape[0]:
+            raise ValueError("pred_points and pred_logits must contain the same number of candidates")
+
+        num_candidates = pred_logits.shape[0]
+        if num_candidates == 0:
+            empty_points = pred_points.new_zeros((0, 2))
+            empty_scores = pred_logits.new_zeros((0,))
+            empty_indices = torch.zeros((0,), dtype=torch.long, device=pred_logits.device)
+            return {
+                'selected_points': empty_points,
+                'selected_logits': empty_scores,
+                'selected_scores': empty_scores,
+                'selected_indices': empty_indices,
+                'selected_k': 0,
+                'candidate_scores': empty_scores,
+            }
+
+        max_k = max(1, min(int(max_k), num_candidates))
+        min_k = max(1, min(int(min_k), max_k))
+
+        sorted_logits, sorted_indices = torch.sort(pred_logits, descending=True)
+        sorted_points = pred_points[sorted_indices]
+        sorted_scores = torch.sigmoid(sorted_logits)
+
+        top1_score = sorted_scores[0]
+        threshold = torch.maximum(
+            sorted_scores.new_tensor(float(abs_threshold)),
+            top1_score * float(rel_ratio)
+        )
+
+        keep_mask = sorted_scores >= threshold
+        keep_count = int(keep_mask.sum().item())
+        selected_k = max(min_k, min(max_k, keep_count if keep_count > 0 else 1))
+
+        return {
+            'selected_points': sorted_points[:selected_k],
+            'selected_logits': sorted_logits[:selected_k],
+            'selected_scores': sorted_scores[:selected_k],
+            'selected_indices': sorted_indices[:selected_k],
+            'selected_k': selected_k,
+            'candidate_scores': sorted_scores,
+        }
+
+    def decode_grid_logits_dynamic(
+        self,
+        grid_logits,
+        abs_threshold=0.35,
+        rel_ratio=0.75,
+        min_k=1,
+        max_k=6
+    ):
+        candidate_points, candidate_logits = self.decode_grid_logits(
+            grid_logits,
+            top_k=self.num_grid_logits
+        )
+
+        selected_points = []
+        selected_logits = []
+        selected_scores = []
+        selected_indices = []
+        selected_ks = []
+        candidate_scores = []
+
+        for points, logits in zip(candidate_points, candidate_logits):
+            selected = self.select_dynamic_topk(
+                points,
+                logits,
+                abs_threshold=abs_threshold,
+                rel_ratio=rel_ratio,
+                min_k=min_k,
+                max_k=max_k
+            )
+            selected_points.append(selected['selected_points'])
+            selected_logits.append(selected['selected_logits'])
+            selected_scores.append(selected['selected_scores'])
+            selected_indices.append(selected['selected_indices'])
+            selected_ks.append(selected['selected_k'])
+            candidate_scores.append(selected['candidate_scores'])
+
+        return {
+            'selected_points': selected_points,
+            'selected_logits': selected_logits,
+            'selected_scores': selected_scores,
+            'selected_indices': selected_indices,
+            'selected_ks': selected_ks,
+            'candidate_points': candidate_points,
+            'candidate_logits': candidate_logits,
+            'candidate_scores': candidate_scores,
+        }
+
     def predict_point_regression(self, visual_features, text_features=None, attention_mask=None):
         visual_summary = visual_features.mean(dim=1)
         text_summary = self._pool_text_features(
