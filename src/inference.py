@@ -7,7 +7,7 @@ import argparse
 import json
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 # 添加src到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +62,21 @@ class CoordinateAdapterInference:
         _, self.transform = setup_transforms(self.config)
         print(f"Model loaded successfully. Using device: {self.device}")
 
+    @staticmethod
+    def _load_font(size, bold=False):
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except OSError:
+                    pass
+        return ImageFont.load_default()
+
     def _load_adapter_weights(self, adapter_path):
         """加载Adapter权重。"""
         if not os.path.exists(adapter_path):
@@ -106,6 +121,22 @@ class CoordinateAdapterInference:
 
         return image_tensor, grid_image_tensor, original_size
 
+    def preprocess_pil_image(self, image, grid_image=None):
+        if not isinstance(image, Image.Image):
+            raise TypeError("image must be a PIL.Image.Image")
+
+        image = image.convert('RGB')
+        original_size = image.size
+        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+
+        if grid_image is not None:
+            grid_image = grid_image.convert('RGB')
+            grid_image_tensor = self.transform(grid_image).unsqueeze(0).to(self.device)
+        else:
+            grid_image_tensor = image_tensor.clone()
+
+        return image_tensor, grid_image_tensor, original_size
+
     def _build_instruction(self, query):
         return f"请根据网格坐标系，在图像中定位'{query}'的位置，输出坐标点[x,y]格式。"
 
@@ -126,7 +157,153 @@ class CoordinateAdapterInference:
             for x, y in normalized_points
         ]
 
-    def predict(self, image_path, query, return_text=False, grid_image_path=None, return_normalized=False):
+    def _run_model(self, image_tensor, grid_image_tensor, query, use_dynamic_topk=False, dynamic_topk_params=None):
+        instruction = self._build_instruction(query)
+        input_ids, attention_mask = self._encode_text(instruction)
+        adapter_dtype = next(self.adapter.parameters()).dtype
+        dynamic_topk_params = dynamic_topk_params or {}
+
+        with torch.no_grad():
+            visual_features = self.qwen_model.encode_image(image_tensor)
+            if visual_features.dtype != adapter_dtype:
+                visual_features = visual_features.to(dtype=adapter_dtype)
+
+            enhanced_features = self.adapter(image_tensor, grid_image_tensor, visual_features)
+
+            text_embeddings = self.qwen_model.encode_text(input_ids, attention_mask)
+            if text_embeddings.dtype != adapter_dtype:
+                text_embeddings = text_embeddings.to(dtype=adapter_dtype)
+
+            if getattr(self.adapter, 'output_mode', 'point_regression') == 'grid_logits':
+                pred_grid_logits = self.adapter.predict_grid_logits(
+                    enhanced_features,
+                    text_features=text_embeddings,
+                    attention_mask=attention_mask
+                )
+                if use_dynamic_topk:
+                    selected = self.adapter.decode_grid_logits_dynamic(
+                        pred_grid_logits,
+                        abs_threshold=dynamic_topk_params.get('abs_threshold', 0.35),
+                        rel_ratio=dynamic_topk_params.get('rel_ratio', 0.75),
+                        min_k=dynamic_topk_params.get('min_k', 1),
+                        max_k=dynamic_topk_params.get('max_k', 6)
+                    )
+                    pred_points = selected['selected_points'][0].detach().cpu()
+                    pred_logits = selected['selected_logits'][0].detach().cpu()
+                    selection_mode = 'dynamic_topk'
+                    selected_k = int(selected['selected_ks'][0])
+                    dynamic_meta = {
+                        'abs_threshold': float(dynamic_topk_params.get('abs_threshold', 0.35)),
+                        'rel_ratio': float(dynamic_topk_params.get('rel_ratio', 0.75)),
+                        'min_k': int(dynamic_topk_params.get('min_k', 1)),
+                        'max_k': int(dynamic_topk_params.get('max_k', 6)),
+                    }
+                else:
+                    pred_points, pred_logits = self.adapter.decode_grid_logits(
+                        pred_grid_logits,
+                        top_k=self.adapter.num_output_points
+                    )
+                    pred_points = pred_points[0].detach().cpu()
+                    pred_logits = pred_logits[0].detach().cpu()
+                    selection_mode = 'fixed_topk'
+                    selected_k = len(pred_points)
+                    dynamic_meta = None
+            else:
+                pred_points, pred_logits = self.adapter.predict_point_regression(
+                    enhanced_features,
+                    text_features=text_embeddings,
+                    attention_mask=attention_mask
+                )
+                pred_points = pred_points[0].detach().cpu()
+                pred_logits = pred_logits[0].detach().cpu()
+                selection_mode = 'fixed_topk'
+                selected_k = len(pred_points)
+                dynamic_meta = None
+
+        return {
+            'instruction': instruction,
+            'pred_points': pred_points,
+            'pred_logits': pred_logits,
+            'selection_mode': selection_mode,
+            'selected_k': selected_k,
+            'dynamic_topk_params': dynamic_meta,
+        }
+
+    def render_prediction_overlay(self, image, absolute_points, scores, query):
+        canvas = image.convert('RGB').copy()
+        draw = ImageDraw.Draw(canvas)
+        title_font = self._load_font(20, bold=True)
+        score_font = self._load_font(16)
+
+        for idx, ((x, y), score) in enumerate(zip(absolute_points, scores), start=1):
+            radius = 10
+            bbox = [x - radius, y - radius, x + radius, y + radius]
+            draw.ellipse(bbox, outline="#dc2626", width=3)
+            draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill="#dc2626")
+            draw.text((x + 14, y - 12), f"P{idx}", fill="#dc2626", font=title_font)
+            draw.text((x + 14, y + 10), f"{float(score):.2f}", fill="#991b1b", font=score_font)
+
+        draw.rectangle([0, 0, canvas.width, 34], fill=(245, 247, 251))
+        draw.text((12, 7), f"Query: {query}", fill="#111827", font=score_font)
+        return canvas
+
+    def predict_from_pil(
+        self,
+        image,
+        query,
+        grid_image=None,
+        use_dynamic_topk=False,
+        dynamic_topk_params=None,
+        include_annotated_image=True
+    ):
+        image_tensor, grid_image_tensor, original_size = self.preprocess_pil_image(
+            image,
+            grid_image=grid_image
+        )
+        outputs = self._run_model(
+            image_tensor,
+            grid_image_tensor,
+            query,
+            use_dynamic_topk=use_dynamic_topk,
+            dynamic_topk_params=dynamic_topk_params
+        )
+
+        normalized_points = outputs['pred_points'].tolist()
+        scores = torch.sigmoid(outputs['pred_logits']).tolist()
+        absolute_points = self._to_absolute_points(normalized_points, original_size)
+        summary = {
+            'query': query,
+            'instruction': outputs['instruction'],
+            'output_mode': getattr(self.adapter, 'output_mode', 'point_regression'),
+            'normalized_points': [[round(float(x), 4), round(float(y), 4)] for x, y in normalized_points],
+            'absolute_points': absolute_points,
+            'scores': [round(float(score), 4) for score in scores],
+            'image_size': list(original_size),
+            'selection_mode': outputs['selection_mode'],
+            'selected_k': int(outputs['selected_k']),
+            'dynamic_topk_params': outputs['dynamic_topk_params'],
+        }
+
+        if include_annotated_image:
+            summary['annotated_image'] = self.render_prediction_overlay(
+                image,
+                absolute_points,
+                summary['scores'],
+                query
+            )
+
+        return summary
+
+    def predict(
+        self,
+        image_path,
+        query,
+        return_text=False,
+        grid_image_path=None,
+        return_normalized=False,
+        use_dynamic_topk=False,
+        dynamic_topk_params=None
+    ):
         """
         预测坐标
 
@@ -140,54 +317,17 @@ class CoordinateAdapterInference:
         Returns:
             绝对像素坐标列表，或详细预测摘要
         """
-        image, grid_image, original_size = self.preprocess_image(
-            image_path,
-            grid_image_path=grid_image_path
+        image = Image.open(image_path).convert('RGB')
+        grid_image = Image.open(grid_image_path).convert('RGB') if grid_image_path and os.path.exists(grid_image_path) else None
+        summary = self.predict_from_pil(
+            image,
+            query,
+            grid_image=grid_image,
+            use_dynamic_topk=use_dynamic_topk,
+            dynamic_topk_params=dynamic_topk_params,
+            include_annotated_image=False
         )
-        instruction = self._build_instruction(query)
-        input_ids, attention_mask = self._encode_text(instruction)
-        adapter_dtype = next(self.adapter.parameters()).dtype
-
-        with torch.no_grad():
-            visual_features = self.qwen_model.encode_image(image)
-            if visual_features.dtype != adapter_dtype:
-                visual_features = visual_features.to(dtype=adapter_dtype)
-
-            enhanced_features = self.adapter(image, grid_image, visual_features)
-
-            text_embeddings = self.qwen_model.encode_text(input_ids, attention_mask)
-            if text_embeddings.dtype != adapter_dtype:
-                text_embeddings = text_embeddings.to(dtype=adapter_dtype)
-
-            if getattr(self.adapter, 'output_mode', 'point_regression') == 'grid_logits':
-                pred_grid_logits = self.adapter.predict_grid_logits(
-                    enhanced_features,
-                    text_features=text_embeddings,
-                    attention_mask=attention_mask
-                )
-                pred_points, pred_logits = self.adapter.decode_grid_logits(
-                    pred_grid_logits,
-                    top_k=self.adapter.num_output_points
-                )
-            else:
-                pred_points, pred_logits = self.adapter.predict_point_regression(
-                    enhanced_features,
-                    text_features=text_embeddings,
-                    attention_mask=attention_mask
-                )
-
-        normalized_points = pred_points[0].detach().cpu().tolist()
-        scores = torch.sigmoid(pred_logits[0]).detach().cpu().tolist()
-        absolute_points = self._to_absolute_points(normalized_points, original_size)
-        summary = {
-            'query': query,
-            'instruction': instruction,
-            'output_mode': getattr(self.adapter, 'output_mode', 'point_regression'),
-            'normalized_points': [[round(float(x), 4), round(float(y), 4)] for x, y in normalized_points],
-            'absolute_points': absolute_points,
-            'scores': [round(float(score), 4) for score in scores],
-            'image_size': list(original_size)
-        }
+        absolute_points = summary['absolute_points']
 
         if return_normalized:
             return summary
@@ -244,25 +384,13 @@ class CoordinateAdapterInference:
         save_path = os.path.join(save_dir, image_name)
 
         image = Image.open(image_path).convert('RGB')
-
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as patches
-
-        fig, ax = plt.subplots(1, figsize=(10, 10))
-        ax.imshow(image)
-
-        for idx, point in enumerate(points):
-            x, y = point
-            circle = patches.Circle((x, y), radius=10, color='red', fill=False, linewidth=2)
-            ax.add_patch(circle)
-            ax.plot(x, y, 'ro', markersize=5)
-            ax.text(x + 15, y - 15, f'{idx + 1}', color='red', fontsize=12, weight='bold')
-
-        ax.set_title(f'Query: {query}', fontsize=14)
-        ax.axis('off')
-
-        plt.savefig(save_path, bbox_inches='tight', dpi=150)
-        plt.close()
+        annotated = self.render_prediction_overlay(
+            image,
+            points,
+            [1.0] * len(points),
+            query
+        )
+        annotated.save(save_path)
 
         result = {
             'image_path': image_path,
@@ -296,6 +424,11 @@ def main():
     parser.add_argument('--save_dir', type=str, default='predictions', help='保存目录')
     parser.add_argument('--return_text', action='store_true', help='返回详细预测摘要')
     parser.add_argument('--return_normalized', action='store_true', help='输出归一化坐标和分数')
+    parser.add_argument('--dynamic_topk', action='store_true', help='启用动态 top-k 解码')
+    parser.add_argument('--dynamic_abs_threshold', type=float, default=0.35, help='动态 top-k 绝对阈值')
+    parser.add_argument('--dynamic_rel_ratio', type=float, default=0.75, help='动态 top-k 相对 top1 比例')
+    parser.add_argument('--dynamic_min_k', type=int, default=1, help='动态 top-k 最小点数')
+    parser.add_argument('--dynamic_max_k', type=int, default=6, help='动态 top-k 最大点数')
 
     args = parser.parse_args()
 
@@ -324,7 +457,14 @@ def main():
             args.image_path,
             args.query,
             grid_image_path=args.grid_image_path,
-            return_normalized=True
+            return_normalized=True,
+            use_dynamic_topk=args.dynamic_topk,
+            dynamic_topk_params={
+                'abs_threshold': args.dynamic_abs_threshold,
+                'rel_ratio': args.dynamic_rel_ratio,
+                'min_k': args.dynamic_min_k,
+                'max_k': args.dynamic_max_k,
+            }
         )
         points = prediction_payload['absolute_points']
         print(json.dumps(prediction_payload, ensure_ascii=False, indent=2))
@@ -333,14 +473,28 @@ def main():
             args.image_path,
             args.query,
             return_text=True,
-            grid_image_path=args.grid_image_path
+            grid_image_path=args.grid_image_path,
+            use_dynamic_topk=args.dynamic_topk,
+            dynamic_topk_params={
+                'abs_threshold': args.dynamic_abs_threshold,
+                'rel_ratio': args.dynamic_rel_ratio,
+                'min_k': args.dynamic_min_k,
+                'max_k': args.dynamic_max_k,
+            }
         )
         print(f"Prediction summary: {text}")
     else:
         points = inferencer.predict(
             args.image_path,
             args.query,
-            grid_image_path=args.grid_image_path
+            grid_image_path=args.grid_image_path,
+            use_dynamic_topk=args.dynamic_topk,
+            dynamic_topk_params={
+                'abs_threshold': args.dynamic_abs_threshold,
+                'rel_ratio': args.dynamic_rel_ratio,
+                'min_k': args.dynamic_min_k,
+                'max_k': args.dynamic_max_k,
+            }
         )
 
     print(f"Query: {args.query}")

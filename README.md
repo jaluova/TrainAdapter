@@ -225,6 +225,69 @@ The inference path is compatible with both:
 - current `grid_logits` checkpoints
 - older point-regression checkpoints through the compatibility branch
 
+The CLI also supports dynamic decoding for qualitative use:
+
+```bash
+python src/inference.py \
+  --adapter_path /path/to/checkpoint.pth \
+  --config /path/to/config.json \
+  --image_path /path/to/image.jpg \
+  --query "the man on the left" \
+  --return_normalized \
+  --dynamic_topk
+```
+
+## Web Demo
+
+The project now includes a lightweight upload-and-query demo split into two processes:
+
+1. A local inference service on the training machine that keeps Qwen and the adapter loaded.
+2. A Gradio web page on the public server that forwards requests to that inference service.
+
+### Training Machine: Start Inference Service
+
+```bash
+python src/inference_service.py \
+  --config /root/autodl-tmp/Data/train_outputs/fast10000_from5000best_lr2e-5_5epoch_20260401/config.json \
+  --adapter_path /root/autodl-tmp/Data/train_outputs/fast10000_from5000best_lr2e-5_5epoch_20260401/checkpoints/best_model.pth \
+  --qwen_model_path /root/autodl-tmp/modelscope/Qwen2.5-VL-7B-Instruct \
+  --device cuda \
+  --host 127.0.0.1 \
+  --port 8765
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8765/health
+```
+
+### Public Server: Start Gradio Page
+
+If the public server cannot directly access the training machine's local `8765` port, create an SSH tunnel first:
+
+```bash
+ssh -N -L 127.0.0.1:8765:127.0.0.1:8765 -p 22605 root@region-9.autodl.pro
+```
+
+Then start the Gradio page:
+
+```bash
+python src/web_demo.py \
+  --inference_url http://127.0.0.1:8765 \
+  --host 127.0.0.1 \
+  --port 7860
+```
+
+The Gradio page provides:
+
+- image upload
+- query input
+- optional dynamic top-k controls
+- annotated image output
+- predicted-point table
+- raw JSON response
+
 ## Local Training Monitor
 
 The local monitor is a small polling web service that fetches remote status through SSH and renders:
