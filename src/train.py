@@ -377,6 +377,7 @@ def main():
     parser.add_argument('--save_dir', type=str, default=None, help='保存目录')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
     parser.add_argument('--resume', type=str, default=None, help='从检查点恢复')
+    parser.add_argument('--resume_as_init', action='store_true', help='仅加载模型权重，将checkpoint作为新一轮训练初始化')
     
     # 模型参数
     parser.add_argument('--adapter_type', type=str, choices=['standard', 'lightweight'], help='Adapter类型')
@@ -439,6 +440,8 @@ def main():
     # 设置恢复检查点
     if args.resume:
         config.resume_from = args.resume
+    if args.resume_as_init:
+        config.resume_as_init = True
     
     # 打印配置
     print("=" * 50)
@@ -455,6 +458,7 @@ def main():
     print(f"Coordinate mode: {config.data.target_coordinate_mode}")
     print(f"Save dir: {config.logging.save_dir}")
     print(f"Device: {config.device}")
+    print(f"Resume as init: {config.resume_as_init}")
     print("=" * 50)
     
     # 创建保存目录
@@ -536,7 +540,8 @@ def main():
         eval_interval=config.logging.eval_interval,
         save_interval=config.logging.save_interval,
         loss_type=config.training.loss_type,
-        use_amp=config.training.use_amp
+        use_amp=config.training.use_amp,
+        early_stop_patience_evals=config.training.early_stop_patience_evals
     )
     
     # 开始训练
@@ -546,7 +551,8 @@ def main():
     
     trainer.train(
         num_epochs=config.training.num_epochs,
-        resume_from=config.resume_from
+        resume_from=config.resume_from,
+        resume_as_init=config.resume_as_init
     )
     
     print("\n" + "=" * 50)

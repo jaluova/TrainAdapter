@@ -25,6 +25,7 @@ Qwen2.5-VL-7B-Instruct/
 visualizations/
 predictions/
 train_outputs/
+artifacts/
 *.log
 *.out
 *.pth

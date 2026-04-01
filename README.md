@@ -159,7 +159,7 @@ The processed annotation file consumed by training is `grefs_with_grids.json`.
 From `src/`:
 
 ```bash
-python train.py --preset default --batch_size 4 --num_epochs 6 --device cuda
+python train.py --preset default --batch_size 8 --num_epochs 4 --device cuda
 ```
 
 Useful overrides:
@@ -167,21 +167,29 @@ Useful overrides:
 ```bash
 python train.py \
   --preset default \
-  --data_root /root/autodl-tmp/Data1000 \
-  --save_dir /root/autodl-tmp/Data/train_outputs/fast1000_grid_6epoch_20260331 \
-  --batch_size 4 \
-  --num_epochs 6 \
+  --data_root /root/autodl-tmp/Data/fast5000 \
+  --save_dir /root/autodl-tmp/Data/train_outputs/fast5000_grid_lr3e-5_4epoch_20260401 \
+  --batch_size 8 \
+  --num_epochs 4 \
+  --lr 3e-5 \
   --device cuda
 ```
 
-Resume from a checkpoint:
+Start a fresh short continuation round from the current `best_model.pth`:
 
 ```bash
 python train.py \
-  --config /root/autodl-tmp/Data/train_outputs/fast1000_grid_6epoch_20260331/config.json \
-  --resume /root/autodl-tmp/Data/train_outputs/fast1000_grid_6epoch_20260331/checkpoints/checkpoint_step_766.pth \
+  --config /root/autodl-tmp/Data/train_outputs/fast5000_grid_bs8_8epoch_20260401/config.json \
+  --save_dir /root/autodl-tmp/Data/train_outputs/fast5000_grid_lr3e-5_4epoch_20260401 \
+  --resume /root/autodl-tmp/Data/train_outputs/fast5000_grid_bs8_8epoch_20260401/checkpoints/best_model.pth \
+  --resume_as_init \
+  --batch_size 8 \
+  --num_epochs 4 \
+  --lr 3e-5 \
   --device cuda
 ```
+
+`--resume_as_init` only loads `model_state_dict`; optimizer state, scheduler state, epoch/step counters, and best-metric tracking are reset so the new run behaves like a clean comparison experiment.
 
 ## Visualization
 

@@ -35,7 +35,8 @@ class CoordinateAdapterTrainer:
                  eval_interval=500,
                  save_interval=500,
                  loss_type='hungarian_point',
-                 use_amp=False):
+                 use_amp=False,
+                 early_stop_patience_evals=0):
         """
         Args:
             adapter: Coordinate Adapter模型
@@ -69,6 +70,7 @@ class CoordinateAdapterTrainer:
         self.save_interval = save_interval
         self.loss_type = loss_type
         self.use_amp = bool(use_amp and str(device).startswith('cuda'))
+        self.early_stop_patience_evals = max(int(early_stop_patience_evals or 0), 0)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.resume_reset_optimizer = self._read_env_flag('TRAIN_ADAPTER_RESUME_RESET_OPTIMIZER', default=True)
         self.resume_reset_scheduler = self._read_env_flag('TRAIN_ADAPTER_RESUME_RESET_SCHEDULER', default=True)
@@ -95,6 +97,7 @@ class CoordinateAdapterTrainer:
         self.best_acc_5 = -1.0
         self.best_acc_top4 = -1.0
         self._accumulated_batches = 0
+        self._stale_validation_count = 0
         self.qualitative_top_k = min(4, getattr(self.adapter, 'num_output_points', 4))
         self.qualitative_panel_indices = self._select_qualitative_indices()
         
@@ -202,7 +205,7 @@ class CoordinateAdapterTrainer:
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr_value
 
-    def load_checkpoint(self, checkpoint_path):
+    def load_checkpoint(self, checkpoint_path, resume_as_init=False):
         """加载检查点"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
@@ -217,19 +220,43 @@ class CoordinateAdapterTrainer:
         elif self.scheduler and self.resume_reset_scheduler:
             self.logger.info("Skipped scheduler state restore; using fresh scheduler state")
         
-        self.global_step = checkpoint['step']
-        self.epoch = checkpoint['epoch']
-        self.best_loss = checkpoint['best_loss']
-        self.best_acc_1grid = checkpoint.get('best_acc_1grid', self.best_acc_1grid)
-        self.best_acc_5 = checkpoint.get('best_acc_5', self.best_acc_5)
-        self.best_acc_top4 = checkpoint.get('best_acc_top4', self.best_acc_top4)
-        # 恢复时重新开始梯度累积，避免依赖未保存的中间梯度状态。
-        self._accumulated_batches = 0
+        if resume_as_init:
+            self.global_step = 0
+            self.epoch = 0
+            self.best_loss = float('inf')
+            self.best_acc_1grid = -1.0
+            self.best_acc_5 = -1.0
+            self.best_acc_top4 = -1.0
+            self._stale_validation_count = 0
+            self._accumulated_batches = 0
+            self.logger.info("Loaded checkpoint as initialization only; reset optimizer/scheduler progress and best metrics")
+        else:
+            self.global_step = checkpoint['step']
+            self.epoch = checkpoint['epoch']
+            self.best_loss = checkpoint['best_loss']
+            self.best_acc_1grid = checkpoint.get('best_acc_1grid', self.best_acc_1grid)
+            self.best_acc_5 = checkpoint.get('best_acc_5', self.best_acc_5)
+            self.best_acc_top4 = checkpoint.get('best_acc_top4', self.best_acc_top4)
+            self._accumulated_batches = 0
         if self.override_lr is not None:
             self._set_learning_rate(self.override_lr)
             self.logger.info(f"Overrode optimizer lr to {self.override_lr}")
         
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
+
+    def _is_better_validation(self, metrics, val_loss):
+        return (
+            metrics['acc_1grid'] > self.best_acc_1grid or
+            (
+                metrics['acc_1grid'] == self.best_acc_1grid and
+                metrics['acc_top4'] > self.best_acc_top4
+            ) or
+            (
+                metrics['acc_1grid'] == self.best_acc_1grid and
+                metrics['acc_top4'] == self.best_acc_top4 and
+                val_loss < self.best_loss
+            )
+        )
 
     def _ensure_finite_tensor(self, value, name):
         if torch.is_tensor(value):
@@ -671,7 +698,7 @@ class CoordinateAdapterTrainer:
         metrics['acc_10'] = metrics['acc_top4']
         return metrics
     
-    def train(self, num_epochs, resume_from=None):
+    def train(self, num_epochs, resume_from=None, resume_as_init=False):
         """
         训练模型
         
@@ -680,13 +707,14 @@ class CoordinateAdapterTrainer:
             resume_from: 从检查点恢复训练
         """
         if resume_from:
-            self.load_checkpoint(resume_from)
-        start_epoch = self.epoch if resume_from else 0
+            self.load_checkpoint(resume_from, resume_as_init=resume_as_init)
+        start_epoch = 0 if (resume_from and resume_as_init) else (self.epoch if resume_from else 0)
         
         self.logger.info(f"Start training for {num_epochs} epochs")
         self.optimizer.zero_grad(set_to_none=True)
         self._accumulated_batches = 0
         
+        should_stop_early = False
         for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
             self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
@@ -736,27 +764,30 @@ class CoordinateAdapterTrainer:
                                 self.logger.info(f"Saved qualitative panel to {metrics['qualitative_panel_dir']}")
                             
                             # 保存最佳模型
-                            if (
-                                metrics['acc_1grid'] > self.best_acc_1grid or
-                                (
-                                    metrics['acc_1grid'] == self.best_acc_1grid and
-                                    metrics['acc_top4'] > self.best_acc_top4
-                                ) or
-                                (
-                                    metrics['acc_1grid'] == self.best_acc_1grid and
-                                    metrics['acc_top4'] == self.best_acc_top4 and
-                                    val_loss < self.best_loss
-                                )
-                            ):
+                            if self._is_better_validation(metrics, val_loss):
                                 self.best_acc_1grid = metrics['acc_1grid']
                                 self.best_acc_5 = metrics['acc_top4']
                                 self.best_acc_top4 = metrics['acc_top4']
                                 self.best_loss = val_loss
+                                self._stale_validation_count = 0
                                 self.save_checkpoint(self.global_step, val_loss, is_best=True)
+                            else:
+                                self._stale_validation_count += 1
+                                if self.early_stop_patience_evals > 0:
+                                    self.logger.info(
+                                        f"No validation improvement for {self._stale_validation_count} eval(s); "
+                                        f"patience={self.early_stop_patience_evals}"
+                                    )
+                                    if self._stale_validation_count >= self.early_stop_patience_evals:
+                                        self.logger.info("Early stopping triggered by validation plateau")
+                                        should_stop_early = True
                     
                     # 保存检查点
                     if self.global_step % self.save_interval == 0:
                         self.save_checkpoint(self.global_step, loss)
+
+                    if should_stop_early:
+                        break
                 
                 except Exception as e:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -768,6 +799,9 @@ class CoordinateAdapterTrainer:
 
             if self._accumulated_batches > 0:
                 self._optimizer_step()
+
+            if should_stop_early:
+                break
             
             #  epoch结束
             avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0.0

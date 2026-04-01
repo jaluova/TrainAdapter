@@ -82,7 +82,7 @@ class DataConfig:
 class TrainingConfig:
     """训练配置"""
     # 优化器
-    lr: float = 5e-5
+    lr: float = 3e-5
     weight_decay: float = 0.01
     betas: tuple = (0.9, 0.999)
     
@@ -97,6 +97,7 @@ class TrainingConfig:
     warmup_steps: int = 200
     warmup_ratio: float = 0.05
     scheduler_type: str = 'cosine'  # 'cosine' or 'linear'
+    early_stop_patience_evals: int = 3
     
     # Loss配置
     loss_type: str = 'bce_grid'
@@ -140,6 +141,7 @@ class Config:
     
     # 恢复训练
     resume_from: Optional[str] = None
+    resume_as_init: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -150,7 +152,8 @@ class Config:
             'logging': self.logging.__dict__,
             'device': self.device,
             'seed': self.seed,
-            'resume_from': self.resume_from
+            'resume_from': self.resume_from,
+            'resume_as_init': self.resume_as_init
         }
     
     def save(self, save_path: str):
@@ -177,6 +180,7 @@ class Config:
         config.device = config_dict.get('device', 'cuda')
         config.seed = config_dict.get('seed', 42)
         config.resume_from = config_dict.get('resume_from')
+        config.resume_as_init = config_dict.get('resume_as_init', False)
         
         return config
     
@@ -222,7 +226,7 @@ def get_default_config():
 
     config.training.batch_size = 8
     config.training.gradient_accumulation_steps = 1
-    config.training.lr = 5e-5
+    config.training.lr = 3e-5
     config.training.num_epochs = 4
     config.training.loss_type = 'bce_grid'
     config.training.grid_pos_weight = 5.0
@@ -231,6 +235,7 @@ def get_default_config():
     config.training.ranking_loss_weight = 0.2
     config.training.use_primary_grid_target = True
     config.training.use_amp = False
+    config.training.early_stop_patience_evals = 3
     config.logging.eval_interval = 500
     config.logging.save_interval = 500
     return config
