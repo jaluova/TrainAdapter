@@ -25,7 +25,9 @@ class HungarianPointLoss(nn.Module):
                  loss_type='hungarian_point',
                  grid_size=11,
                  grid_pos_weight=4.0,
-                 neighbor_soft_label_weight=0.3):
+                 neighbor_soft_label_weight=0.3,
+                 ranking_margin=0.2,
+                 ranking_loss_weight=0.2):
         super(HungarianPointLoss, self).__init__()
         
         self.inside_bbox_weight = inside_bbox_weight
@@ -36,6 +38,8 @@ class HungarianPointLoss(nn.Module):
         self.grid_size = grid_size
         self.grid_pos_weight = grid_pos_weight
         self.neighbor_soft_label_weight = neighbor_soft_label_weight
+        self.ranking_margin = ranking_margin
+        self.ranking_loss_weight = ranking_loss_weight
         
     def parse_coordinates_from_text(self, text_outputs, image_width, image_height):
         """
@@ -314,6 +318,31 @@ class HungarianPointLoss(nn.Module):
         )
         return points, values
 
+    def _grid_ranking_loss(self, pred_grid_logits, grid_targets):
+        positive_mask = grid_targets >= 0.999
+        candidate_negative_mask = grid_targets <= max(float(self.neighbor_soft_label_weight), 0.0)
+
+        losses = []
+        for batch_idx in range(pred_grid_logits.shape[0]):
+            pos_indices = torch.nonzero(positive_mask[batch_idx], as_tuple=False).squeeze(-1)
+            if pos_indices.numel() == 0:
+                continue
+
+            neg_indices = torch.nonzero(candidate_negative_mask[batch_idx], as_tuple=False).squeeze(-1)
+            if neg_indices.numel() == 0:
+                continue
+
+            pos_logits = pred_grid_logits[batch_idx, pos_indices]
+            neg_logits = pred_grid_logits[batch_idx, neg_indices]
+            hardest_negative = neg_logits.max()
+            hardest_positive = pos_logits.max()
+            sample_loss = F.relu(self.ranking_margin - hardest_positive + hardest_negative)
+            losses.append(sample_loss)
+
+        if not losses:
+            return pred_grid_logits.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
     def _grid_classification_loss(self, pred_grid_logits, grid_targets, gt_points_list=None, top_k=4):
         pos_weight = pred_grid_logits.new_full((pred_grid_logits.shape[-1],), float(self.grid_pos_weight))
         bce_loss = F.binary_cross_entropy_with_logits(
@@ -324,6 +353,8 @@ class HungarianPointLoss(nn.Module):
         )
         sample_losses = bce_loss.mean(dim=-1)
         total_loss = sample_losses.mean()
+        ranking_loss = self._grid_ranking_loss(pred_grid_logits, grid_targets)
+        total_loss = total_loss + self.ranking_loss_weight * ranking_loss
 
         pred_points, pred_logits = self._grid_logits_to_points(pred_grid_logits, top_k=top_k)
         pred_scores = torch.sigmoid(pred_logits)
@@ -353,7 +384,8 @@ class HungarianPointLoss(nn.Module):
                 'sample_loss': float(sample_losses[batch_idx].detach().cpu()),
                 'coordinate_mode': 'normalized_grid',
                 'loss_type': 'bce_grid',
-                'min_grid_distance': min_grid_distance
+                'min_grid_distance': min_grid_distance,
+                'ranking_loss': float(ranking_loss.detach().cpu())
             })
 
         return total_loss, match_info

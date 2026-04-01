@@ -106,6 +106,7 @@ def build_dataset(config):
         output_mode=config.model.output_mode,
         grid_size=config.model.grid_size,
         neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+        use_primary_grid_target=config.training.use_primary_grid_target,
         relation_keywords=config.data.relation_keywords
     )
     return dataset

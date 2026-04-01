@@ -33,7 +33,7 @@ class CoordinateAdapterTrainer:
                  gradient_accumulation_steps=1,
                  log_interval=10,
                  eval_interval=500,
-                 save_interval=1000,
+                 save_interval=500,
                  loss_type='hungarian_point',
                  use_amp=False):
         """
@@ -70,8 +70,8 @@ class CoordinateAdapterTrainer:
         self.loss_type = loss_type
         self.use_amp = bool(use_amp and str(device).startswith('cuda'))
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
-        self.resume_reset_optimizer = self._read_env_flag('TRAIN_ADAPTER_RESUME_RESET_OPTIMIZER', default=False)
-        self.resume_reset_scheduler = self._read_env_flag('TRAIN_ADAPTER_RESUME_RESET_SCHEDULER', default=False)
+        self.resume_reset_optimizer = self._read_env_flag('TRAIN_ADAPTER_RESUME_RESET_OPTIMIZER', default=True)
+        self.resume_reset_scheduler = self._read_env_flag('TRAIN_ADAPTER_RESUME_RESET_SCHEDULER', default=True)
         self.stop_on_nonfinite = self._read_env_flag('TRAIN_ADAPTER_STOP_ON_NONFINITE', default=True)
         self.override_lr = self._read_env_float('TRAIN_ADAPTER_OVERRIDE_LR')
         
@@ -91,6 +91,7 @@ class CoordinateAdapterTrainer:
         self.global_step = 0
         self.epoch = 0
         self.best_loss = float('inf')
+        self.best_acc_1grid = -1.0
         self.best_acc_5 = -1.0
         self.best_acc_top4 = -1.0
         self._accumulated_batches = 0
@@ -152,6 +153,7 @@ class CoordinateAdapterTrainer:
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'loss': loss,
             'best_loss': self.best_loss,
+            'best_acc_1grid': self.best_acc_1grid,
             'best_acc_5': self.best_acc_5,
             'best_acc_top4': self.best_acc_top4,
             'loss_type': self.loss_type,
@@ -218,6 +220,7 @@ class CoordinateAdapterTrainer:
         self.global_step = checkpoint['step']
         self.epoch = checkpoint['epoch']
         self.best_loss = checkpoint['best_loss']
+        self.best_acc_1grid = checkpoint.get('best_acc_1grid', self.best_acc_1grid)
         self.best_acc_5 = checkpoint.get('best_acc_5', self.best_acc_5)
         self.best_acc_top4 = checkpoint.get('best_acc_top4', self.best_acc_top4)
         # 恢复时重新开始梯度累积，避免依赖未保存的中间梯度状态。
@@ -734,9 +737,18 @@ class CoordinateAdapterTrainer:
                             
                             # 保存最佳模型
                             if (
-                                metrics['acc_top4'] > self.best_acc_top4 or
-                                (metrics['acc_top4'] == self.best_acc_top4 and val_loss < self.best_loss)
+                                metrics['acc_1grid'] > self.best_acc_1grid or
+                                (
+                                    metrics['acc_1grid'] == self.best_acc_1grid and
+                                    metrics['acc_top4'] > self.best_acc_top4
+                                ) or
+                                (
+                                    metrics['acc_1grid'] == self.best_acc_1grid and
+                                    metrics['acc_top4'] == self.best_acc_top4 and
+                                    val_loss < self.best_loss
+                                )
                             ):
+                                self.best_acc_1grid = metrics['acc_1grid']
                                 self.best_acc_5 = metrics['acc_top4']
                                 self.best_acc_top4 = metrics['acc_top4']
                                 self.best_loss = val_loss

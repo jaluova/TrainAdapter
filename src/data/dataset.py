@@ -42,19 +42,68 @@ def normalize_grid_points(grid_points, grid_divisions=GRID_DIVISIONS):
     return normalized
 
 
+def select_primary_grid_point(grid_points, grid_size=11):
+    """
+    为稠密 grid_points 选择一个主监督点。
+    规则：取去重后的离散点集合，选择距离几何中心最近的点；
+    如有并列，优先更靠近图像中心的点，再按坐标稳定排序。
+    """
+    discrete_points = []
+    seen = set()
+    for x, y in flatten_grid_points(grid_points):
+        ix = int(round(x))
+        iy = int(round(y))
+        if not (0 <= ix < grid_size and 0 <= iy < grid_size):
+            continue
+        key = (ix, iy)
+        if key in seen:
+            continue
+        seen.add(key)
+        discrete_points.append([ix, iy])
+
+    if not discrete_points:
+        return None
+
+    points_array = np.asarray(discrete_points, dtype=np.float32)
+    centroid = points_array.mean(axis=0)
+    center = np.asarray([(grid_size - 1) / 2.0, (grid_size - 1) / 2.0], dtype=np.float32)
+
+    best_point = None
+    best_key = None
+    for point in discrete_points:
+        point_arr = np.asarray(point, dtype=np.float32)
+        centroid_distance = float(np.linalg.norm(point_arr - centroid))
+        center_distance = float(np.linalg.norm(point_arr - center))
+        sort_key = (round(centroid_distance, 6), round(center_distance, 6), point[1], point[0])
+        if best_key is None or sort_key < best_key:
+            best_key = sort_key
+            best_point = point
+
+    return best_point
+
+
 def is_relation_query(query, relation_keywords=None):
     keywords = relation_keywords or DEFAULT_RELATION_KEYWORDS
     lowered = str(query).lower()
     return any(keyword in lowered for keyword in keywords)
 
 
-def build_grid_target(grid_points, grid_size=11, neighbor_soft_label_weight=0.3):
+def build_grid_target(
+    grid_points,
+    grid_size=11,
+    neighbor_soft_label_weight=0.3,
+    use_primary_point_only=False
+):
     """
     将离散网格点转换成 [grid_size * grid_size] 的 soft multi-hot 监督。
     真值点为 1.0，8 邻域平滑为 neighbor_soft_label_weight。
     """
     target = torch.zeros(grid_size * grid_size, dtype=torch.float32)
-    discrete_points = flatten_grid_points(grid_points)
+    if use_primary_point_only:
+        primary_point = select_primary_grid_point(grid_points, grid_size=grid_size)
+        discrete_points = [primary_point] if primary_point is not None else []
+    else:
+        discrete_points = flatten_grid_points(grid_points)
 
     for point in discrete_points:
         x = int(round(point[0]))
@@ -263,6 +312,7 @@ class CoordinateDataset(Dataset):
                  output_mode='grid_logits',
                  grid_size=11,
                  neighbor_soft_label_weight=0.3,
+                 use_primary_grid_target=False,
                  relation_keywords=None):
         """
         Args:
@@ -287,6 +337,7 @@ class CoordinateDataset(Dataset):
         self.output_mode = output_mode
         self.grid_size = grid_size
         self.neighbor_soft_label_weight = neighbor_soft_label_weight
+        self.use_primary_grid_target = use_primary_grid_target
         self.relation_keywords = tuple(relation_keywords or DEFAULT_RELATION_KEYWORDS)
         
         # 加载分词器
@@ -482,7 +533,8 @@ class CoordinateDataset(Dataset):
             'grid_target': build_grid_target(
                 sample['grid_points'],
                 grid_size=self.grid_size,
-                neighbor_soft_label_weight=self.neighbor_soft_label_weight
+                neighbor_soft_label_weight=self.neighbor_soft_label_weight,
+                use_primary_point_only=self.use_primary_grid_target
             ),
             'image_size': (image_width, image_height),
             'query': sample['query'],
@@ -514,6 +566,7 @@ class CoordinateDatasetV2(Dataset):
                  output_mode='grid_logits',
                  grid_size=11,
                  neighbor_soft_label_weight=0.3,
+                 use_primary_grid_target=False,
                  relation_keywords=None,
                  use_negative_samples=True,
                  negative_sample_ratio=0.2):
@@ -534,6 +587,7 @@ class CoordinateDatasetV2(Dataset):
         self.output_mode = output_mode
         self.grid_size = grid_size
         self.neighbor_soft_label_weight = neighbor_soft_label_weight
+        self.use_primary_grid_target = use_primary_grid_target
         self.relation_keywords = tuple(relation_keywords or DEFAULT_RELATION_KEYWORDS)
         self.use_negative_samples = use_negative_samples
         self.negative_sample_ratio = negative_sample_ratio
@@ -663,7 +717,8 @@ class CoordinateDatasetV2(Dataset):
             'grid_target': build_grid_target(
                 sample['grid_points'],
                 grid_size=self.grid_size,
-                neighbor_soft_label_weight=self.neighbor_soft_label_weight
+                neighbor_soft_label_weight=self.neighbor_soft_label_weight,
+                use_primary_point_only=self.use_primary_grid_target
             ),
             'image_size': (image_width, image_height),
             'query': sample['query'],

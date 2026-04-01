@@ -68,6 +68,7 @@ class DataConfig:
     split_by_image: bool = True
     val_ratio: float = 0.2
     relation_query_oversample: bool = True
+    relation_query_weight: float = 1.2
     relation_keywords: tuple = (
         'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and'
     )
@@ -87,7 +88,7 @@ class TrainingConfig:
     
     # 训练参数
     batch_size: int = 8
-    num_epochs: int = 12
+    num_epochs: int = 4
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     
@@ -103,9 +104,12 @@ class TrainingConfig:
     outside_bbox_weight: float = 0.1
     match_cost: str = 'euclidean'  # 'euclidean', 'l1', 'smooth_l1'
     boundary_penalty_weight: float = 0.1
-    grid_pos_weight: float = 4.0
-    neighbor_soft_label_weight: float = 0.3
-    use_amp: bool = True
+    grid_pos_weight: float = 5.0
+    neighbor_soft_label_weight: float = 0.15
+    ranking_margin: float = 0.2
+    ranking_loss_weight: float = 0.2
+    use_primary_grid_target: bool = True
+    use_amp: bool = False
 
 
 @dataclass
@@ -113,7 +117,7 @@ class LoggingConfig:
     """日志配置"""
     log_interval: int = 10
     eval_interval: int = 500
-    save_interval: int = 1000
+    save_interval: int = 500
     save_dir: str = field(default_factory=_default_save_dir)
     
     # WandB配置（可选）
@@ -214,15 +218,21 @@ def get_default_config():
     config.data.split_by_image = True
     config.data.val_ratio = 0.2
     config.data.relation_query_oversample = True
+    config.data.relation_query_weight = 1.2
 
-    config.training.batch_size = 4
-    config.training.gradient_accumulation_steps = 4
-    config.training.lr = 1e-4
-    config.training.num_epochs = 12
+    config.training.batch_size = 8
+    config.training.gradient_accumulation_steps = 1
+    config.training.lr = 5e-5
+    config.training.num_epochs = 4
     config.training.loss_type = 'bce_grid'
-    config.training.grid_pos_weight = 4.0
-    config.training.neighbor_soft_label_weight = 0.3
-    config.training.use_amp = True
+    config.training.grid_pos_weight = 5.0
+    config.training.neighbor_soft_label_weight = 0.15
+    config.training.ranking_margin = 0.2
+    config.training.ranking_loss_weight = 0.2
+    config.training.use_primary_grid_target = True
+    config.training.use_amp = False
+    config.logging.eval_interval = 500
+    config.logging.save_interval = 500
     return config
 
 

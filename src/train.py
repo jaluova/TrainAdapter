@@ -262,6 +262,7 @@ def create_dataloaders(config, train_transform, val_transform):
         output_mode=config.model.output_mode,
         grid_size=config.model.grid_size,
         neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+        use_primary_grid_target=config.training.use_primary_grid_target,
         relation_keywords=config.data.relation_keywords
     )
 
@@ -293,6 +294,7 @@ def create_dataloaders(config, train_transform, val_transform):
                 output_mode=config.model.output_mode,
                 grid_size=config.model.grid_size,
                 neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+                use_primary_grid_target=config.training.use_primary_grid_target,
                 relation_keywords=config.data.relation_keywords
             )
             val_dataset = Subset(val_base_dataset, val_indices)
@@ -313,6 +315,7 @@ def create_dataloaders(config, train_transform, val_transform):
             output_mode=config.model.output_mode,
             grid_size=config.model.grid_size,
             neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+            use_primary_grid_target=config.training.use_primary_grid_target,
             relation_keywords=config.data.relation_keywords
         )
 
@@ -322,12 +325,12 @@ def create_dataloaders(config, train_transform, val_transform):
             weights = []
             for subset_index in train_dataset.indices:
                 sample = base_dataset.samples[subset_index]
-                weights.append(2.5 if sample.get('query') and any(
+                weights.append(config.data.relation_query_weight if sample.get('query') and any(
                     keyword in sample['query'].lower() for keyword in config.data.relation_keywords
                 ) else 1.0)
         else:
             weights = [
-                2.5 if sample.get('query') and any(
+                config.data.relation_query_weight if sample.get('query') and any(
                     keyword in sample['query'].lower() for keyword in config.data.relation_keywords
                 ) else 1.0
                 for sample in train_dataset.samples
@@ -497,7 +500,9 @@ def main():
         loss_type=config.training.loss_type,
         grid_size=config.model.grid_size,
         grid_pos_weight=config.training.grid_pos_weight,
-        neighbor_soft_label_weight=config.training.neighbor_soft_label_weight
+        neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
+        ranking_margin=config.training.ranking_margin,
+        ranking_loss_weight=config.training.ranking_loss_weight
     )
     
     # 创建优化器和调度器
