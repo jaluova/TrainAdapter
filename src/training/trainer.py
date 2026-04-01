@@ -70,6 +70,10 @@ class CoordinateAdapterTrainer:
         self.loss_type = loss_type
         self.use_amp = bool(use_amp and str(device).startswith('cuda'))
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.resume_reset_optimizer = self._read_env_flag('TRAIN_ADAPTER_RESUME_RESET_OPTIMIZER', default=False)
+        self.resume_reset_scheduler = self._read_env_flag('TRAIN_ADAPTER_RESUME_RESET_SCHEDULER', default=False)
+        self.stop_on_nonfinite = self._read_env_flag('TRAIN_ADAPTER_STOP_ON_NONFINITE', default=True)
+        self.override_lr = self._read_env_float('TRAIN_ADAPTER_OVERRIDE_LR')
         
         # 创建保存目录
         os.makedirs(save_dir, exist_ok=True)
@@ -95,6 +99,20 @@ class CoordinateAdapterTrainer:
         
         # 冻结Qwen模型
         self._freeze_qwen_model()
+
+    @staticmethod
+    def _read_env_flag(name, default=False):
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+    @staticmethod
+    def _read_env_float(name):
+        value = os.environ.get(name)
+        if value is None or value == '':
+            return None
+        return float(value)
     
     def _setup_logging(self):
         """设置日志"""
@@ -176,15 +194,26 @@ class CoordinateAdapterTrainer:
             except FileNotFoundError:
                 continue
     
+    def _set_learning_rate(self, lr_value):
+        if lr_value is None or self.optimizer is None:
+            return
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr_value
+
     def load_checkpoint(self, checkpoint_path):
         """加载检查点"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.adapter.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if self.optimizer and not self.resume_reset_optimizer and checkpoint.get('optimizer_state_dict'):
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        else:
+            self.logger.info("Skipped optimizer state restore; using fresh optimizer state")
         
-        if self.scheduler and checkpoint['scheduler_state_dict']:
+        if self.scheduler and not self.resume_reset_scheduler and checkpoint.get('scheduler_state_dict'):
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        elif self.scheduler and self.resume_reset_scheduler:
+            self.logger.info("Skipped scheduler state restore; using fresh scheduler state")
         
         self.global_step = checkpoint['step']
         self.epoch = checkpoint['epoch']
@@ -193,8 +222,23 @@ class CoordinateAdapterTrainer:
         self.best_acc_top4 = checkpoint.get('best_acc_top4', self.best_acc_top4)
         # 恢复时重新开始梯度累积，避免依赖未保存的中间梯度状态。
         self._accumulated_batches = 0
+        if self.override_lr is not None:
+            self._set_learning_rate(self.override_lr)
+            self.logger.info(f"Overrode optimizer lr to {self.override_lr}")
         
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
+
+    def _ensure_finite_tensor(self, value, name):
+        if torch.is_tensor(value):
+            is_finite = torch.isfinite(value).all()
+            if bool(is_finite):
+                return
+            raise FloatingPointError(f"Non-finite tensor detected in {name}")
+
+    def _ensure_finite_outputs(self, outputs):
+        for key, value in outputs.items():
+            if value is not None:
+                self._ensure_finite_tensor(value, key)
 
     def _optimizer_step(self):
         if self._accumulated_batches <= 0:
@@ -473,6 +517,7 @@ class CoordinateAdapterTrainer:
         self.adapter.train()
         
         outputs = self.forward_batch(batch)
+        self._ensure_finite_outputs(outputs)
         gt_points_list = batch['gt_points']
         grid_targets = batch['grid_target'].to(self.device)
         image_sizes = batch['image_size']
@@ -491,6 +536,8 @@ class CoordinateAdapterTrainer:
                 gt_points_list=gt_points_list,
                 image_sizes=image_sizes
             )
+
+        self._ensure_finite_tensor(loss, 'train_loss')
 
         for sample_idx, info in enumerate(match_info):
             info['is_relation_query'] = bool(batch['is_relation_query'][sample_idx].item())
@@ -528,6 +575,7 @@ class CoordinateAdapterTrainer:
         with torch.no_grad():
             for batch in tqdm(self.val_dataloader, desc='Evaluating'):
                 outputs = self.forward_batch(batch)
+                self._ensure_finite_outputs(outputs)
                 gt_points_list = batch['gt_points']
                 grid_targets = batch['grid_target'].to(self.device)
                 image_sizes = batch['image_size']
@@ -546,6 +594,7 @@ class CoordinateAdapterTrainer:
                         gt_points_list=gt_points_list,
                         image_sizes=image_sizes
                     )
+                self._ensure_finite_tensor(loss, 'val_loss')
 
                 for sample_idx, info in enumerate(match_info):
                     info['is_relation_query'] = bool(batch['is_relation_query'][sample_idx].item())
@@ -629,12 +678,13 @@ class CoordinateAdapterTrainer:
         """
         if resume_from:
             self.load_checkpoint(resume_from)
+        start_epoch = self.epoch if resume_from else 0
         
         self.logger.info(f"Start training for {num_epochs} epochs")
         self.optimizer.zero_grad(set_to_none=True)
         self._accumulated_batches = 0
         
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
             self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
             
@@ -700,6 +750,8 @@ class CoordinateAdapterTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
                     self._accumulated_batches = 0
                     self.logger.error(f"Error at step {self.global_step}: {str(e)}")
+                    if isinstance(e, FloatingPointError) and self.stop_on_nonfinite:
+                        raise
                     continue
 
             if self._accumulated_batches > 0:
