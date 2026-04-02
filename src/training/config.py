@@ -70,8 +70,22 @@ class DataConfig:
     relation_query_oversample: bool = True
     relation_query_weight: float = 1.2
     relation_keywords: tuple = (
-        'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and'
+        'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and',
+        'center', 'middle', 'near', 'nearest', 'closest', 'far', 'furthest',
+        'first', 'second', 'third', 'fourth', 'last'
     )
+    ordinal_keywords: tuple = (
+        'first', 'second', 'third', 'fourth', 'fifth', 'last',
+        'leftmost', 'rightmost', 'furthest', 'nearest'
+    )
+    multi_entity_keywords: tuple = (
+        ' and ', ' with ', ' between ', ' beside ', ' next to '
+    )
+    difficulty_oversample: bool = True
+    spatial_query_weight: float = 1.8
+    ordinal_query_weight: float = 2.2
+    multi_entity_query_weight: float = 2.0
+    multi_query_image_weight: float = 1.3
     
     # 负样本
     use_negative_samples: bool = False

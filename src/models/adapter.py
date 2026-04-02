@@ -82,7 +82,26 @@ class BaseCoordinateAdapter(nn.Module):
         self.text_pool = AttentionPool(visual_dim)
         self.visual_condition_proj = nn.Linear(visual_dim, visual_dim)
         self.text_condition_proj = nn.Linear(visual_dim, visual_dim)
+        self.visual_query_proj = nn.Linear(visual_dim, visual_dim)
+        self.text_key_proj = nn.Linear(visual_dim, visual_dim)
+        self.text_value_proj = nn.Linear(visual_dim, visual_dim)
+        self.text_context_proj = nn.Linear(visual_dim, visual_dim)
+        self.token_modulation = nn.Sequential(
+            nn.LayerNorm(visual_dim * 3),
+            nn.Linear(visual_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, visual_dim),
+            nn.Sigmoid()
+        )
         self.token_score = nn.Linear(visual_dim, 1)
+        self.token_text_score = nn.Sequential(
+            nn.LayerNorm(visual_dim * 2),
+            nn.Linear(visual_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1)
+        )
         self.grid_classifier = nn.Sequential(
             nn.LayerNorm(visual_dim),
             nn.Linear(visual_dim, hidden_dim),
@@ -127,6 +146,24 @@ class BaseCoordinateAdapter(nn.Module):
             return torch.zeros_like(visual_summary)
         return self.text_pool(text_features, attention_mask=attention_mask)
 
+    def _build_text_conditioning(self, visual_features, text_features=None, attention_mask=None):
+        if text_features is None:
+            return torch.zeros_like(visual_features)
+
+        query = self.visual_query_proj(visual_features)
+        keys = self.text_key_proj(text_features)
+        values = self.text_value_proj(text_features)
+        scale = float(self.visual_dim) ** -0.5
+
+        attention_scores = torch.matmul(query, keys.transpose(-1, -2)) * scale
+        if attention_mask is not None:
+            mask = attention_mask.to(dtype=torch.bool).unsqueeze(1)
+            attention_scores = attention_scores.masked_fill(~mask, torch.finfo(attention_scores.dtype).min)
+
+        attention_weights = torch.softmax(attention_scores, dim=-1)
+        text_context = torch.matmul(attention_weights, values)
+        return self.text_context_proj(text_context)
+
     def predict_grid_logits(self, visual_features, text_features=None, attention_mask=None):
         visual_summary = visual_features.mean(dim=1)
         text_summary = self._pool_text_features(
@@ -134,13 +171,28 @@ class BaseCoordinateAdapter(nn.Module):
             attention_mask=attention_mask,
             visual_summary=visual_summary
         )
-
-        conditioned_tokens = F.gelu(
-            self.visual_condition_proj(visual_features) +
-            self.text_condition_proj(text_summary).unsqueeze(1)
+        text_condition = self._build_text_conditioning(
+            visual_features,
+            text_features=text_features,
+            attention_mask=attention_mask
         )
+        expanded_text_summary = text_summary.unsqueeze(1).expand(-1, visual_features.shape[1], -1)
+
+        conditioned_tokens = (
+            self.visual_condition_proj(visual_features) +
+            self.text_condition_proj(expanded_text_summary) +
+            text_condition
+        )
+        token_modulation = self.token_modulation(
+            torch.cat([visual_features, text_condition, expanded_text_summary], dim=-1)
+        )
+        conditioned_tokens = F.gelu(conditioned_tokens) * (1.0 + token_modulation)
         token_logits = self.grid_classifier(conditioned_tokens)
-        token_weights = torch.softmax(self.token_score(conditioned_tokens).squeeze(-1), dim=1)
+        token_weight_logits = self.token_score(conditioned_tokens).squeeze(-1)
+        token_weight_logits = token_weight_logits + self.token_text_score(
+            torch.cat([conditioned_tokens, text_condition], dim=-1)
+        ).squeeze(-1)
+        token_weights = torch.softmax(token_weight_logits, dim=1)
         grid_logits = torch.sum(token_logits * token_weights.unsqueeze(-1), dim=1)
         return grid_logits
 

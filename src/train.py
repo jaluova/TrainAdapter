@@ -5,6 +5,7 @@ import os
 import sys
 import argparse
 import math
+from collections import Counter
 import torch
 import torch.nn as nn
 import numpy as np
@@ -263,7 +264,9 @@ def create_dataloaders(config, train_transform, val_transform):
         grid_size=config.model.grid_size,
         neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
         use_primary_grid_target=config.training.use_primary_grid_target,
-        relation_keywords=config.data.relation_keywords
+        relation_keywords=config.data.relation_keywords,
+        ordinal_keywords=config.data.ordinal_keywords,
+        multi_entity_keywords=config.data.multi_entity_keywords
     )
 
     train_dataset = full_dataset
@@ -295,7 +298,9 @@ def create_dataloaders(config, train_transform, val_transform):
                 grid_size=config.model.grid_size,
                 neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
                 use_primary_grid_target=config.training.use_primary_grid_target,
-                relation_keywords=config.data.relation_keywords
+                relation_keywords=config.data.relation_keywords,
+                ordinal_keywords=config.data.ordinal_keywords,
+                multi_entity_keywords=config.data.multi_entity_keywords
             )
             val_dataset = Subset(val_base_dataset, val_indices)
 
@@ -316,30 +321,60 @@ def create_dataloaders(config, train_transform, val_transform):
             grid_size=config.model.grid_size,
             neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
             use_primary_grid_target=config.training.use_primary_grid_target,
-            relation_keywords=config.data.relation_keywords
+            relation_keywords=config.data.relation_keywords,
+            ordinal_keywords=config.data.ordinal_keywords,
+            multi_entity_keywords=config.data.multi_entity_keywords
         )
 
-    if config.data.relation_query_oversample:
-        if isinstance(train_dataset, Subset):
-            base_dataset = train_dataset.dataset
-            weights = []
-            for subset_index in train_dataset.indices:
-                sample = base_dataset.samples[subset_index]
-                weights.append(config.data.relation_query_weight if sample.get('query') and any(
-                    keyword in sample['query'].lower() for keyword in config.data.relation_keywords
-                ) else 1.0)
-        else:
-            weights = [
-                config.data.relation_query_weight if sample.get('query') and any(
-                    keyword in sample['query'].lower() for keyword in config.data.relation_keywords
-                ) else 1.0
-                for sample in train_dataset.samples
-            ]
+    def _get_train_samples(dataset):
+        if isinstance(dataset, Subset):
+            base_dataset = dataset.dataset
+            return [base_dataset.samples[idx] for idx in dataset.indices]
+        return list(dataset.samples)
+
+    train_samples = _get_train_samples(train_dataset)
+
+    if config.data.relation_query_oversample or config.data.difficulty_oversample:
+        weights = []
+        for sample in train_samples:
+            weight = 1.0
+            difficulty_tag = sample.get('difficulty_tag', 'easy_salient')
+            if config.data.difficulty_oversample:
+                if difficulty_tag == 'spatial_relation':
+                    weight = max(weight, float(config.data.spatial_query_weight))
+                elif difficulty_tag == 'ordinal':
+                    weight = max(weight, float(config.data.ordinal_query_weight))
+                elif difficulty_tag == 'multi_entity':
+                    weight = max(weight, float(config.data.multi_entity_query_weight))
+
+                if int(sample.get('image_sample_count', 1)) > 1:
+                    weight = max(weight, float(config.data.multi_query_image_weight))
+
+            if config.data.relation_query_oversample and sample.get('query') and any(
+                keyword in sample['query'].lower() for keyword in config.data.relation_keywords
+            ):
+                weight = max(weight, float(config.data.relation_query_weight))
+            weights.append(weight)
+
         sampler = WeightedRandomSampler(
             weights=torch.tensor(weights, dtype=torch.double),
             num_samples=len(weights),
             replacement=True
         )
+
+    difficulty_counter = Counter(sample.get('difficulty_tag', 'easy_salient') for sample in train_samples)
+    relation_count = sum(
+        1 for sample in train_samples
+        if sample.get('query') and any(keyword in sample['query'].lower() for keyword in config.data.relation_keywords)
+    )
+    multi_query_image_count = sum(1 for sample in train_samples if int(sample.get('image_sample_count', 1)) > 1)
+    print("Train sample difficulty stats:")
+    for tag in ('easy_salient', 'spatial_relation', 'ordinal', 'multi_entity'):
+        print(f"  {tag}: {difficulty_counter.get(tag, 0)}")
+    print(f"  relation-tagged samples: {relation_count}")
+    print(f"  multi-query-image samples: {multi_query_image_count}")
+    if sampler is not None:
+        print("  sampler weighting enabled")
 
     train_dataloader = DataLoader(
         train_dataset,

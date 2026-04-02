@@ -13,7 +13,16 @@ from transformers import AutoTokenizer
 
 GRID_DIVISIONS = 10.0
 DEFAULT_RELATION_KEYWORDS = (
-    'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and'
+    'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and',
+    'center', 'middle', 'near', 'nearest', 'closest', 'far', 'furthest',
+    'first', 'second', 'third', 'fourth', 'last'
+)
+DEFAULT_ORDINAL_KEYWORDS = (
+    'first', 'second', 'third', 'fourth', 'fifth', 'last',
+    'leftmost', 'rightmost', 'furthest', 'nearest'
+)
+DEFAULT_MULTI_ENTITY_KEYWORDS = (
+    ' and ', ' with ', ' between ', ' beside ', ' next to '
 )
 
 
@@ -86,6 +95,38 @@ def is_relation_query(query, relation_keywords=None):
     keywords = relation_keywords or DEFAULT_RELATION_KEYWORDS
     lowered = str(query).lower()
     return any(keyword in lowered for keyword in keywords)
+
+
+def is_ordinal_query(query, ordinal_keywords=None):
+    keywords = ordinal_keywords or DEFAULT_ORDINAL_KEYWORDS
+    lowered = f" {str(query).lower()} "
+    return any(keyword in lowered for keyword in keywords)
+
+
+def is_multi_entity_query(query, multi_entity_keywords=None):
+    keywords = multi_entity_keywords or DEFAULT_MULTI_ENTITY_KEYWORDS
+    lowered = f" {str(query).lower()} "
+    return any(keyword in lowered for keyword in keywords)
+
+
+def classify_query_difficulty(
+    sample,
+    relation_keywords=None,
+    ordinal_keywords=None,
+    multi_entity_keywords=None
+):
+    query = str(sample.get('query', '')).strip()
+    image_sample_count = int(sample.get('image_sample_count', 1))
+
+    if is_ordinal_query(query, ordinal_keywords=ordinal_keywords):
+        return 'ordinal'
+    if is_multi_entity_query(query, multi_entity_keywords=multi_entity_keywords):
+        return 'multi_entity'
+    if is_relation_query(query, relation_keywords=relation_keywords):
+        return 'spatial_relation'
+    if image_sample_count > 1:
+        return 'multi_entity'
+    return 'easy_salient'
 
 
 def build_grid_target(
@@ -313,7 +354,9 @@ class CoordinateDataset(Dataset):
                  grid_size=11,
                  neighbor_soft_label_weight=0.3,
                  use_primary_grid_target=False,
-                 relation_keywords=None):
+                 relation_keywords=None,
+                 ordinal_keywords=None,
+                 multi_entity_keywords=None):
         """
         Args:
             data_root: 数据根目录
@@ -339,6 +382,8 @@ class CoordinateDataset(Dataset):
         self.neighbor_soft_label_weight = neighbor_soft_label_weight
         self.use_primary_grid_target = use_primary_grid_target
         self.relation_keywords = tuple(relation_keywords or DEFAULT_RELATION_KEYWORDS)
+        self.ordinal_keywords = tuple(ordinal_keywords or DEFAULT_ORDINAL_KEYWORDS)
+        self.multi_entity_keywords = tuple(multi_entity_keywords or DEFAULT_MULTI_ENTITY_KEYWORDS)
         
         # 加载分词器
         self.tokenizer = self._load_tokenizer(tokenizer_path)
@@ -371,6 +416,9 @@ class CoordinateDataset(Dataset):
         """
         samples = []
         
+        image_counts = {}
+        normalized_annotations = []
+
         for idx, ann in enumerate(self.annotations):
             img_id = ann.get('file_name') or ann.get('img_id')
             # 确保 img_id 有效且为字符串，如果是数字，转换为旧的COCO格式
@@ -385,6 +433,13 @@ class CoordinateDataset(Dataset):
             
             if not img_id or not sentences or not grid_points:
                 continue
+
+            normalized_annotations.append((idx, ann, str(img_id)))
+            image_counts[str(img_id)] = image_counts.get(str(img_id), 0) + 1
+
+        for idx, ann, img_id in normalized_annotations:
+            sentences = ann.get('sentences', [])
+            grid_points = ann.get('grid_points', [])
             
             # 使用句子的 'sent' 或第一个元素的文本
             query = sentences[0].get('sent', sentences[0]) if isinstance(sentences[0], dict) else sentences[0]
@@ -395,8 +450,15 @@ class CoordinateDataset(Dataset):
                 'query': query,  # 使用第一个句子作为查询
                 'grid_points': grid_points,  # 真值坐标点
                 'grid_image_path': grid_image_path,
-                'index': idx
+                'index': idx,
+                'image_sample_count': image_counts.get(str(img_id), 1)
             }
+            sample['difficulty_tag'] = classify_query_difficulty(
+                sample,
+                relation_keywords=self.relation_keywords,
+                ordinal_keywords=self.ordinal_keywords,
+                multi_entity_keywords=self.multi_entity_keywords
+            )
             
             # 过滤掉本地实际不存在的图像，以防止DataLoader由于文件不存在而崩溃
             image_path = os.path.join(self.data_root, self.image_dir, sample['image_id'])
@@ -541,6 +603,10 @@ class CoordinateDataset(Dataset):
             'instruction': instruction,
             'target_coordinate_mode': self.target_coordinate_mode,
             'is_relation_query': is_relation_query(sample['query'], self.relation_keywords),
+            'is_ordinal_query': is_ordinal_query(sample['query'], self.ordinal_keywords),
+            'is_multi_entity_query': is_multi_entity_query(sample['query'], self.multi_entity_keywords),
+            'difficulty_tag': sample['difficulty_tag'],
+            'image_sample_count': sample.get('image_sample_count', 1),
             'image_id': sample['image_id']
         }
         
