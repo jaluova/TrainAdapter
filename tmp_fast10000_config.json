@@ -1,0 +1,91 @@
+{
+  "model": {
+    "adapter_type": "lightweight",
+    "visual_dim": 768,
+    "grid_feature_dim": 256,
+    "hidden_dim": 256,
+    "num_heads": 4,
+    "num_grid_tokens": 25,
+    "dropout": 0.1,
+    "qwen_model_path": "/root/autodl-tmp/modelscope/Qwen2.5-VL-7B-Instruct",
+    "freeze_qwen": true,
+    "num_output_points": 4,
+    "output_mode": "grid_logits",
+    "grid_size": 11
+  },
+  "data": {
+    "data_root": "/root/autodl-tmp/Data/fast10000",
+    "annotation_file": "grefs_with_grids.json",
+    "image_dir": "images",
+    "grid_image_dir": "grid_images",
+    "image_size": [
+      448,
+      448
+    ],
+    "max_length": 512,
+    "use_data_augmentation": true,
+    "color_jitter": true,
+    "random_resized_crop": true,
+    "horizontal_flip": false,
+    "target_point_strategy": "all",
+    "target_coordinate_mode": "normalized_grid",
+    "split_by_image": true,
+    "val_ratio": 0.2,
+    "relation_query_oversample": true,
+    "relation_query_weight": 1.2,
+    "relation_keywords": [
+      "left",
+      "right",
+      "top",
+      "bottom",
+      "front",
+      "behind",
+      "between",
+      "with",
+      "and"
+    ],
+    "use_negative_samples": false,
+    "negative_sample_ratio": 0.2
+  },
+  "training": {
+    "lr": 2e-05,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "batch_size": 8,
+    "num_epochs": 5,
+    "gradient_accumulation_steps": 1,
+    "max_grad_norm": 1.0,
+    "use_scheduler": true,
+    "warmup_steps": 200,
+    "warmup_ratio": 0.05,
+    "scheduler_type": "cosine",
+    "early_stop_patience_evals": 3,
+    "loss_type": "bce_grid",
+    "inside_bbox_weight": 1.0,
+    "outside_bbox_weight": 0.1,
+    "match_cost": "euclidean",
+    "boundary_penalty_weight": 0.1,
+    "grid_pos_weight": 4.0,
+    "neighbor_soft_label_weight": 0.3,
+    "ranking_margin": 0.2,
+    "ranking_loss_weight": 0.2,
+    "use_primary_grid_target": true,
+    "use_amp": false
+  },
+  "logging": {
+    "log_interval": 10,
+    "eval_interval": 500,
+    "save_interval": 1000,
+    "save_dir": "/root/autodl-tmp/Data/train_outputs/fast10000_from5000best_lr2e-5_5epoch_20260401",
+    "use_wandb": false,
+    "wandb_project": "coordinate-adapter",
+    "wandb_name": null
+  },
+  "device": "cuda",
+  "seed": 42,
+  "resume_from": "/root/autodl-tmp/Data/train_outputs/fast5000_grid_bs8_8epoch_20260401/checkpoints/best_model.pth",
+  "resume_as_init": true
+}

@@ -418,10 +418,10 @@ class CoordinateDataset(Dataset):
             完整的指令文本
         """
         instruction_templates = [
-            f"请根据网格坐标系，在图像中定位'{query}'的位置，输出坐标点[x,y]格式。",
-            f"在网格坐标系中找到'{query}'，并返回其坐标[x,y]。",
-            f"根据图像中的网格坐标，定位'{query}'的位置坐标。",
-            f"请识别'{query}'在网格坐标系中的位置，输出格式[x,y]。"
+            f"Given the grid coordinate system, locate the referent described as '{query}' in the image and predict its target coordinates.",
+            f"Use the grid as spatial guidance to find '{query}' in the image and return the most likely target points.",
+            f"Locate '{query}' with the help of the image grid and predict the corresponding target coordinates.",
+            f"Identify where '{query}' is in the image according to the grid and output the most likely target points."
         ]
         
         template = random.choice(instruction_templates)
@@ -670,7 +670,7 @@ class CoordinateDatasetV2(Dataset):
             return CoordinateDataset._build_instruction(self, query)
         else:
             # 负样本指令
-            return f"在图像中定位'{query}'，如果不存在则回答'未找到'。"
+            return f"Locate '{query}' in the image. If it does not exist, answer 'not found'."
     
     def __getitem__(self, idx):
         """获取样本"""

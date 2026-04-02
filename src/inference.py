@@ -138,7 +138,10 @@ class CoordinateAdapterInference:
         return image_tensor, grid_image_tensor, original_size
 
     def _build_instruction(self, query):
-        return f"请根据网格坐标系，在图像中定位'{query}'的位置，输出坐标点[x,y]格式。"
+        return (
+            f"Given the grid coordinate system, locate the referent described as "
+            f"'{query}' in the image and predict the most likely target points."
+        )
 
     def _encode_text(self, instruction):
         encoding = self.tokenizer(
