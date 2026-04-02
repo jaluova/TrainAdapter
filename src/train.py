@@ -574,6 +574,7 @@ def main():
         log_interval=config.logging.log_interval,
         eval_interval=config.logging.eval_interval,
         save_interval=config.logging.save_interval,
+        preview_interval=getattr(config.logging, 'preview_interval', 0),
         loss_type=config.training.loss_type,
         use_amp=config.training.use_amp,
         early_stop_patience_evals=config.training.early_stop_patience_evals

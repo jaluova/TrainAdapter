@@ -133,6 +133,7 @@ class LoggingConfig:
     log_interval: int = 10
     eval_interval: int = 500
     save_interval: int = 500
+    preview_interval: int = 0
     save_dir: str = field(default_factory=_default_save_dir)
     
     # WandB配置（可选）
@@ -252,6 +253,7 @@ def get_default_config():
     config.training.early_stop_patience_evals = 3
     config.logging.eval_interval = 500
     config.logging.save_interval = 500
+    config.logging.preview_interval = 0
     return config
 
 

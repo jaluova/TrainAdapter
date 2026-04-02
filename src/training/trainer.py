@@ -34,6 +34,7 @@ class CoordinateAdapterTrainer:
                  log_interval=10,
                  eval_interval=500,
                  save_interval=500,
+                 preview_interval=0,
                  loss_type='hungarian_point',
                  use_amp=False,
                  early_stop_patience_evals=0):
@@ -68,6 +69,7 @@ class CoordinateAdapterTrainer:
         self.log_interval = log_interval
         self.eval_interval = eval_interval
         self.save_interval = save_interval
+        self.preview_interval = max(int(preview_interval or 0), 0)
         self.loss_type = loss_type
         self.use_amp = bool(use_amp and str(device).startswith('cuda'))
         self.early_stop_patience_evals = max(int(early_stop_patience_evals or 0), 0)
@@ -389,14 +391,14 @@ class CoordinateAdapterTrainer:
         font = self._load_font(18, bold=True)
         draw.text((x + radius + 3, y - radius - 3), label, fill=color, font=font)
 
-    def _save_qualitative_panel(self, step):
+    def _save_qualitative_panel(self, step, panel_root='qualitative_panels', panel_title='Validation Qualitative Panel'):
         if self.val_dataloader is None or not self.qualitative_panel_indices:
             return None
 
         from data.dataset import collate_fn_pad_batch
 
         dataset = self.val_dataloader.dataset
-        panel_dir = os.path.join(self.save_dir, 'qualitative_panels', f'step_{step:06d}')
+        panel_dir = os.path.join(self.save_dir, panel_root, f'step_{step:06d}')
         os.makedirs(panel_dir, exist_ok=True)
 
         manifest = {
@@ -405,6 +407,8 @@ class CoordinateAdapterTrainer:
             'indices': self.qualitative_panel_indices,
             'coordinate_mode': 'normalized_grid',
             'top_k': self.qualitative_top_k,
+            'panel_root': panel_root,
+            'panel_title': panel_title,
         }
 
         title_font = self._load_font(26, bold=True)
@@ -444,7 +448,7 @@ class CoordinateAdapterTrainer:
                 canvas = Image.new('RGB', (canvas_w, canvas_h), '#f5f7fb')
                 draw = ImageDraw.Draw(canvas)
 
-                draw.text((30, 20), "Validation Qualitative Panel", fill="#18212f", font=title_font)
+                draw.text((30, 20), panel_title, fill="#18212f", font=title_font)
                 draw.text((30, 56), f"Image: {image_id}", fill="#334155", font=body_font)
                 draw.text((30, 84), f"Query: {item['query']}", fill="#1f2937", font=body_font)
 
@@ -756,6 +760,15 @@ class CoordinateAdapterTrainer:
                         if relation_sample_losses:
                             log_message += f", Relation Loss: {np.mean(relation_sample_losses):.4f}"
                         self.logger.info(log_message)
+
+                    if self.preview_interval > 0 and self.global_step % self.preview_interval == 0:
+                        preview_dir = self._save_qualitative_panel(
+                            self.global_step,
+                            panel_root='preview_panels',
+                            panel_title='Training Preview Panel'
+                        )
+                        if preview_dir:
+                            self.logger.info(f"Saved preview panel to {preview_dir}")
                     
                     # 验证
                     if self.val_dataloader and self.global_step % self.eval_interval == 0:
