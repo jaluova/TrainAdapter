@@ -10,9 +10,29 @@ import requests
 from PIL import Image
 
 
-def pil_to_base64(image):
+DEFAULT_MAX_IMAGE_EDGE = 1280
+DEFAULT_JPEG_QUALITY = 85
+
+
+def prepare_upload_image(image, max_edge=DEFAULT_MAX_IMAGE_EDGE):
+    image = image.convert("RGB")
+    width, height = image.size
+    longest_edge = max(width, height)
+
+    if longest_edge <= max_edge:
+        return image
+
+    scale = max_edge / float(longest_edge)
+    resized_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+    return image.resize(resized_size, Image.Resampling.LANCZOS)
+
+
+def pil_to_base64(image, jpeg_quality=DEFAULT_JPEG_QUALITY):
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    image.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
@@ -21,14 +41,17 @@ def base64_to_pil(encoded):
 
 
 class RemoteInferenceClient:
-    def __init__(self, inference_url, timeout=180):
+    def __init__(self, inference_url, timeout=180, max_image_edge=DEFAULT_MAX_IMAGE_EDGE, jpeg_quality=DEFAULT_JPEG_QUALITY):
         self.inference_url = inference_url.rstrip("/")
         self.timeout = timeout
+        self.max_image_edge = max_image_edge
+        self.jpeg_quality = jpeg_quality
         self.session = requests.Session()
 
     def predict(self, image, query, use_dynamic_topk, abs_threshold, rel_ratio, min_k, max_k):
+        prepared_image = prepare_upload_image(image, max_edge=self.max_image_edge)
         payload = {
-            "image_base64": pil_to_base64(image),
+            "image_base64": pil_to_base64(prepared_image, jpeg_quality=self.jpeg_quality),
             "query": query,
             "use_dynamic_topk": bool(use_dynamic_topk),
             "abs_threshold": float(abs_threshold),
@@ -81,7 +104,12 @@ def build_point_rows(result):
 
 
 def launch_app(args):
-    client = RemoteInferenceClient(args.inference_url, timeout=args.timeout)
+    client = RemoteInferenceClient(
+        args.inference_url,
+        timeout=args.timeout,
+        max_image_edge=args.max_image_edge,
+        jpeg_quality=args.jpeg_quality,
+    )
 
     def run_demo(image, query, use_dynamic_topk, abs_threshold, rel_ratio, min_k, max_k):
         if image is None:
@@ -151,6 +179,8 @@ def parse_args():
     parser.add_argument("--port", type=int, default=7860, help="Gradio bind port")
     parser.add_argument("--timeout", type=int, default=180, help="Inference request timeout in seconds")
     parser.add_argument("--title", type=str, default="GridGround Demo", help="Page title")
+    parser.add_argument("--max_image_edge", type=int, default=DEFAULT_MAX_IMAGE_EDGE, help="Resize uploaded image so its longest edge does not exceed this value")
+    parser.add_argument("--jpeg_quality", type=int, default=DEFAULT_JPEG_QUALITY, help="JPEG quality used before forwarding the uploaded image")
     return parser.parse_args()
 
 
