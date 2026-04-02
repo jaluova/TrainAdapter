@@ -208,8 +208,16 @@ class CoordinateAdapterTrainer:
     def load_checkpoint(self, checkpoint_path, resume_as_init=False):
         """加载检查点"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        self.adapter.load_state_dict(checkpoint['model_state_dict'])
+
+        strict = not resume_as_init
+        missing_keys, unexpected_keys = self.adapter.load_state_dict(
+            checkpoint['model_state_dict'],
+            strict=strict
+        )
+        if missing_keys:
+            self.logger.info(f"Missing adapter keys when loading checkpoint: {missing_keys}")
+        if unexpected_keys:
+            self.logger.info(f"Unexpected adapter keys when loading checkpoint: {unexpected_keys}")
         if self.optimizer and not self.resume_reset_optimizer and checkpoint.get('optimizer_state_dict'):
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         else:

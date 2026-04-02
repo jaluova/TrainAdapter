@@ -296,24 +296,28 @@ def collate_fn_pad_batch(batch):
     images = [item['image'] for item in batch]
     grid_images = [item['grid_image'] for item in batch]
     
-    # 找到当前batch最大的宽和高
-    max_h = max([img.shape[1] for img in images])
-    max_w = max([img.shape[2] for img in images])
+    # 两路图像都可能存在不同尺寸，padding 时取联合最大宽高。
+    max_h = max(max(img.shape[1] for img in images), max(img.shape[1] for img in grid_images))
+    max_w = max(max(img.shape[2] for img in images), max(img.shape[2] for img in grid_images))
     
     padded_images = []
     padded_grid_images = []
     
     for img, g_img in zip(images, grid_images):
-        # 计算需要padding的大小: (pad_left, pad_right, pad_top, pad_bottom)
-        pad_w = max_w - img.shape[2]
-        pad_h = max_h - img.shape[1]
-        
-        if pad_w > 0 or pad_h > 0:
-            # 使用常量0填充右侧和下方
-            img_padded = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), value=0)
-            g_img_padded = torch.nn.functional.pad(g_img, (0, pad_w, 0, pad_h), value=0)
+        # 两路图像可能原始尺寸不同，需要分别计算 pad。
+        img_pad_w = max_w - img.shape[2]
+        img_pad_h = max_h - img.shape[1]
+        grid_pad_w = max_w - g_img.shape[2]
+        grid_pad_h = max_h - g_img.shape[1]
+
+        if img_pad_w > 0 or img_pad_h > 0:
+            img_padded = torch.nn.functional.pad(img, (0, img_pad_w, 0, img_pad_h), value=0)
         else:
             img_padded = img
+
+        if grid_pad_w > 0 or grid_pad_h > 0:
+            g_img_padded = torch.nn.functional.pad(g_img, (0, grid_pad_w, 0, grid_pad_h), value=0)
+        else:
             g_img_padded = g_img
             
         padded_images.append(img_padded)
