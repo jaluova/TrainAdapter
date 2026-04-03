@@ -101,7 +101,9 @@ class CoordinateAdapterTrainer:
         self._accumulated_batches = 0
         self._stale_validation_count = 0
         self.qualitative_top_k = min(4, getattr(self.adapter, 'num_output_points', 4))
-        self.qualitative_panel_indices = self._select_qualitative_indices()
+        self.qualitative_panel_rotation = 0
+        self._last_qualitative_rotation_step = None
+        self.qualitative_panel_indices = self._select_qualitative_indices(rotation=self.qualitative_panel_rotation)
         
         # 冻结Qwen模型
         self._freeze_qwen_model()
@@ -310,7 +312,7 @@ class CoordinateAdapterTrainer:
         base_idx = indices[idx]
         return base_dataset.samples[base_idx], base_dataset, base_idx
 
-    def _select_qualitative_indices(self, count=6):
+    def _select_qualitative_indices(self, count=6, rotation=0):
         """固定一组更分散的验证样本，优先保证不同图片与不同难度类型。"""
         if self.val_dataloader is None or not hasattr(self.val_dataloader, 'dataset'):
             return []
@@ -335,7 +337,7 @@ class CoordinateAdapterTrainer:
                 difficulty = 'other'
             buckets[difficulty].append((idx, sample_meta))
 
-        def pick_evenly_spaced(entries, desired_count, used_images, used_indices):
+        def pick_evenly_spaced(entries, desired_count, used_images, used_indices, rotation_offset):
             if desired_count <= 0 or not entries:
                 return []
 
@@ -349,14 +351,16 @@ class CoordinateAdapterTrainer:
                 return []
 
             desired_count = min(desired_count, len(available))
+            start = int(rotation_offset) % len(available)
+            rotated_available = available[start:] + available[:start]
             if desired_count >= len(available):
-                chosen = available
+                chosen = rotated_available[:desired_count]
             else:
-                step = len(available) / float(desired_count)
+                step = len(rotated_available) / float(desired_count)
                 chosen = []
                 for i in range(desired_count):
-                    pick_idx = min(int(i * step), len(available) - 1)
-                    chosen.append(available[pick_idx])
+                    pick_idx = min(int(i * step), len(rotated_available) - 1)
+                    chosen.append(rotated_available[pick_idx])
 
             results = []
             for idx, meta in chosen:
@@ -384,7 +388,13 @@ class CoordinateAdapterTrainer:
             if not entries or remaining_slots <= 0:
                 continue
             target = 1 if non_empty_bucket_count >= remaining_slots else min(2, remaining_slots)
-            picked = pick_evenly_spaced(entries, target, used_images, used_indices)
+            picked = pick_evenly_spaced(
+                entries,
+                target,
+                used_images,
+                used_indices,
+                rotation_offset=rotation + len(selected)
+            )
             selected.extend(picked)
             remaining_slots = count - len(selected)
 
@@ -393,10 +403,35 @@ class CoordinateAdapterTrainer:
             for bucket_name in preferred_order + ['other']:
                 combined_pool.extend(buckets[bucket_name])
             selected.extend(
-                pick_evenly_spaced(combined_pool, count - len(selected), used_images, used_indices)
+                pick_evenly_spaced(
+                    combined_pool,
+                    count - len(selected),
+                    used_images,
+                    used_indices,
+                    rotation_offset=rotation + len(selected)
+                )
             )
 
         return sorted(selected[:count])
+
+    def _rotate_qualitative_indices_if_needed(self, step):
+        if self.val_dataloader is None:
+            return
+        if self._last_qualitative_rotation_step is None:
+            self._last_qualitative_rotation_step = step
+            return
+        if step == self._last_qualitative_rotation_step:
+            return
+
+        self.qualitative_panel_rotation += 1
+        self.qualitative_panel_indices = self._select_qualitative_indices(
+            rotation=self.qualitative_panel_rotation
+        )
+        self._last_qualitative_rotation_step = step
+        self.logger.info(
+            f"Rotated qualitative preview group to round {self.qualitative_panel_rotation}: "
+            f"{self.qualitative_panel_indices}"
+        )
 
     def _load_font(self, size, bold=False):
         candidates = [
@@ -465,6 +500,8 @@ class CoordinateAdapterTrainer:
         if self.val_dataloader is None or not self.qualitative_panel_indices:
             return None
 
+        self._rotate_qualitative_indices_if_needed(step)
+
         from data.dataset import collate_fn_pad_batch
 
         dataset = self.val_dataloader.dataset
@@ -479,6 +516,7 @@ class CoordinateAdapterTrainer:
             'top_k': self.qualitative_top_k,
             'panel_root': panel_root,
             'panel_title': panel_title,
+            'rotation_round': self.qualitative_panel_rotation,
         }
 
         title_font = self._load_font(26, bold=True)

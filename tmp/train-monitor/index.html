@@ -78,6 +78,32 @@
         font-size: 14px;
         margin-bottom: 18px;
       }
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+      .action-btn {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 16px;
+        background: var(--accent);
+        color: #f8fcf1;
+        font: inherit;
+        font-size: 14px;
+        cursor: pointer;
+        box-shadow: 0 10px 20px rgba(47, 122, 78, 0.14);
+      }
+      .action-btn[disabled] {
+        cursor: progress;
+        opacity: 0.7;
+      }
+      .toolbar-note {
+        color: var(--muted);
+        font-size: 13px;
+      }
       .status.bad {
         background: #f8e6dc;
         color: var(--warn);
@@ -276,9 +302,13 @@
       <h1>TrainAdapter Local Monitor</h1>
       <div class="sub">本地网页，自动轮询远端 A100 训练日志、GPU 状态和 checkpoint 产出。</div>
 
-      <div id="status" class="status">
-        <span class="dot"></span>
-        <span>连接中…</span>
+      <div class="toolbar">
+        <div id="status" class="status">
+          <span class="dot"></span>
+          <span>连接中…</span>
+        </div>
+        <button id="refreshPreviewBtn" class="action-btn" type="button">重刷 Preview</button>
+        <div id="refreshPreviewNote" class="toolbar-note">会在训练机上重新生成最新 preview panel。</div>
       </div>
 
       <div class="grid">
@@ -368,6 +398,14 @@
         const node = el("status");
         node.className = ok ? "status" : "status bad";
         node.innerHTML = `<span class="dot"></span><span>${text}</span>`;
+      }
+
+      function setRefreshPreviewState(message, busy = false) {
+        const note = el("refreshPreviewNote");
+        const button = el("refreshPreviewBtn");
+        note.textContent = message;
+        button.disabled = busy;
+        button.textContent = busy ? "正在重刷…" : "重刷 Preview";
       }
 
       function renderProcesses(summary) {
@@ -639,6 +677,30 @@
         }
       }
 
+      async function refreshPreview() {
+        setRefreshPreviewState("正在训练机上生成新的 preview panel…", true);
+        try {
+          const resp = await fetch("/api/refresh-preview", {
+            method: "POST",
+            cache: "no-store",
+          });
+          const payload = await resp.json();
+          if (!payload.ok) {
+            throw new Error(payload.error || "Preview refresh failed");
+          }
+          if (payload.status) {
+            render(payload.status);
+          } else {
+            await refresh();
+          }
+          const panelDir = payload.panel_dir ? ` ${payload.panel_dir}` : "";
+          setRefreshPreviewState(`已重刷 preview。${panelDir}`.trim(), false);
+        } catch (err) {
+          setRefreshPreviewState(`重刷失败：${String(err)}`, false);
+        }
+      }
+
+      el("refreshPreviewBtn").addEventListener("click", refreshPreview);
       refresh();
       setInterval(refresh, 5000);
     </script>

@@ -266,7 +266,8 @@ def create_dataloaders(config, train_transform, val_transform):
         use_primary_grid_target=config.training.use_primary_grid_target,
         relation_keywords=config.data.relation_keywords,
         ordinal_keywords=config.data.ordinal_keywords,
-        multi_entity_keywords=config.data.multi_entity_keywords
+        multi_entity_keywords=config.data.multi_entity_keywords,
+        color_keywords=config.data.color_keywords
     )
 
     train_dataset = full_dataset
@@ -300,7 +301,8 @@ def create_dataloaders(config, train_transform, val_transform):
                 use_primary_grid_target=config.training.use_primary_grid_target,
                 relation_keywords=config.data.relation_keywords,
                 ordinal_keywords=config.data.ordinal_keywords,
-                multi_entity_keywords=config.data.multi_entity_keywords
+                multi_entity_keywords=config.data.multi_entity_keywords,
+                color_keywords=config.data.color_keywords
             )
             val_dataset = Subset(val_base_dataset, val_indices)
 
@@ -323,7 +325,8 @@ def create_dataloaders(config, train_transform, val_transform):
             use_primary_grid_target=config.training.use_primary_grid_target,
             relation_keywords=config.data.relation_keywords,
             ordinal_keywords=config.data.ordinal_keywords,
-            multi_entity_keywords=config.data.multi_entity_keywords
+            multi_entity_keywords=config.data.multi_entity_keywords,
+            color_keywords=config.data.color_keywords
         )
 
     def _get_train_samples(dataset):
@@ -334,7 +337,11 @@ def create_dataloaders(config, train_transform, val_transform):
 
     train_samples = _get_train_samples(train_dataset)
 
-    if config.data.relation_query_oversample or config.data.difficulty_oversample:
+    if (
+        config.data.relation_query_oversample or
+        config.data.color_query_oversample or
+        config.data.difficulty_oversample
+    ):
         weights = []
         for sample in train_samples:
             weight = 1.0
@@ -354,6 +361,8 @@ def create_dataloaders(config, train_transform, val_transform):
                 keyword in sample['query'].lower() for keyword in config.data.relation_keywords
             ):
                 weight = max(weight, float(config.data.relation_query_weight))
+            if config.data.color_query_oversample and sample.get('is_color_query', False):
+                weight = max(weight, float(config.data.color_query_weight))
             weights.append(weight)
 
         sampler = WeightedRandomSampler(
@@ -367,11 +376,15 @@ def create_dataloaders(config, train_transform, val_transform):
         1 for sample in train_samples
         if sample.get('query') and any(keyword in sample['query'].lower() for keyword in config.data.relation_keywords)
     )
+    color_count = sum(1 for sample in train_samples if sample.get('is_color_query', False))
+    multi_target_count = sum(1 for sample in train_samples if int(sample.get('gt_point_count', 0)) > 1)
     multi_query_image_count = sum(1 for sample in train_samples if int(sample.get('image_sample_count', 1)) > 1)
     print("Train sample difficulty stats:")
     for tag in ('easy_salient', 'spatial_relation', 'ordinal', 'multi_entity'):
         print(f"  {tag}: {difficulty_counter.get(tag, 0)}")
     print(f"  relation-tagged samples: {relation_count}")
+    print(f"  color-tagged samples: {color_count}")
+    print(f"  multi-target samples: {multi_target_count}")
     print(f"  multi-query-image samples: {multi_query_image_count}")
     if sampler is not None:
         print("  sampler weighting enabled")

@@ -17,6 +17,20 @@ SNAPSHOT_ENABLED = os.environ.get("TRAIN_MONITOR_SNAPSHOT_ENABLED", "1").strip()
 SNAPSHOT_DIR = Path(os.environ.get("TRAIN_MONITOR_SNAPSHOT_DIR", str(ROOT / "snapshots")))
 SNAPSHOT_STEP_INTERVAL = max(int(os.environ.get("TRAIN_MONITOR_SNAPSHOT_STEP_INTERVAL", "100")), 1)
 SNAPSHOT_KEEP = max(int(os.environ.get("TRAIN_MONITOR_SNAPSHOT_KEEP", "200")), 1)
+PREVIEW_REMOTE_PROJECT_DIR = os.environ.get("TRAIN_MONITOR_PREVIEW_PROJECT_DIR", "/root/autodl-tmp/TrainAdapter")
+PREVIEW_REMOTE_PYTHON = os.environ.get("TRAIN_MONITOR_PREVIEW_PYTHON", "/root/autodl-tmp/conda-envs/adapter/bin/python")
+PREVIEW_REMOTE_CONFIG = os.environ.get(
+    "TRAIN_MONITOR_PREVIEW_CONFIG",
+    "/root/autodl-tmp/Data/train_outputs/smoke_text_condition_20260402/config_bs2_monitor.json",
+)
+PREVIEW_REMOTE_CHECKPOINT = os.environ.get(
+    "TRAIN_MONITOR_PREVIEW_CHECKPOINT",
+    "/root/autodl-tmp/Data/train_outputs/fast10000_from5000best_lr2e-5_5epoch_20260401/checkpoints/best_model.pth",
+)
+PREVIEW_REMOTE_DEVICE = os.environ.get("TRAIN_MONITOR_PREVIEW_DEVICE", "cuda")
+PREVIEW_REMOTE_PANEL_ROOT = os.environ.get("TRAIN_MONITOR_PREVIEW_PANEL_ROOT", "preview_panels")
+PREVIEW_REMOTE_PANEL_TITLE = os.environ.get("TRAIN_MONITOR_PREVIEW_PANEL_TITLE", "Training Preview Panel")
+PREVIEW_REMOTE_STEP = int(os.environ.get("TRAIN_MONITOR_PREVIEW_STEP", "999950"))
 
 
 def _compact_command(command: str, limit: int = 140) -> str:
@@ -333,22 +347,14 @@ print(json.dumps(payload, ensure_ascii=False))
 """
 
 
-def _run_remote_command() -> dict[str, Any]:
+def _run_ssh_command(remote_shell_cmd: str, timeout: int = 40) -> str:
     host = _required_env("TRAIN_MONITOR_HOST")
     port = _required_env("TRAIN_MONITOR_PORT")
     user = _required_env("TRAIN_MONITOR_USER")
     password = _required_env("TRAIN_MONITOR_PASSWORD")
-
-    remote_script = _remote_status_script()
-    encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
-    remote_cmd = (
-        "python -c "
-        "\"import base64; exec(base64.b64decode('{}').decode('utf-8'))\"".format(encoded)
-    )
-    remote_shell_cmd = f"bash -lc {shlex.quote(remote_cmd)}"
     expect_script = "\n".join(
         [
-            "set timeout 40",
+            f"set timeout {timeout}",
             f"spawn ssh -o StrictHostKeyChecking=no -p {port} {user}@{host} {{{remote_shell_cmd}}}",
             'expect "password:" {send "' + password + '\\r"}',
             "expect eof",
@@ -363,6 +369,18 @@ def _run_remote_command() -> dict[str, Any]:
     output = completed.stdout
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or output).strip() or "remote command failed")
+    return output
+
+
+def _run_remote_command() -> dict[str, Any]:
+    remote_script = _remote_status_script()
+    encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
+    remote_cmd = (
+        "python -c "
+        "\"import base64; exec(base64.b64decode('{}').decode('utf-8'))\"".format(encoded)
+    )
+    remote_shell_cmd = f"bash -lc {shlex.quote(remote_cmd)}"
+    output = _run_ssh_command(remote_shell_cmd)
 
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     json_line = None
@@ -437,6 +455,7 @@ class StatusCache:
 
 
 STATUS_CACHE = StatusCache()
+REFRESH_LOCK = threading.Lock()
 
 
 def _refresh_loop() -> None:
@@ -469,6 +488,52 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(STATUS_CACHE.get())
             return
         self._send_json({"ok": False, "error": "Not found"}, status=404)
+
+    def do_POST(self) -> None:
+        if self.path == "/api/refresh-preview":
+            self._handle_refresh_preview()
+            return
+        self._send_json({"ok": False, "error": "Not found"}, status=404)
+
+    def _handle_refresh_preview(self) -> None:
+        with REFRESH_LOCK:
+            command = " ".join(
+                [
+                    f"cd {shlex.quote(PREVIEW_REMOTE_PROJECT_DIR)}",
+                    "&&",
+                    shlex.quote(PREVIEW_REMOTE_PYTHON),
+                    "scripts/generate_preview_panel.py",
+                    "--config",
+                    shlex.quote(PREVIEW_REMOTE_CONFIG),
+                    "--checkpoint",
+                    shlex.quote(PREVIEW_REMOTE_CHECKPOINT),
+                    "--device",
+                    shlex.quote(PREVIEW_REMOTE_DEVICE),
+                    "--panel-root",
+                    shlex.quote(PREVIEW_REMOTE_PANEL_ROOT),
+                    "--panel-title",
+                    shlex.quote(PREVIEW_REMOTE_PANEL_TITLE),
+                    "--clear-existing",
+                    "--step",
+                    str(PREVIEW_REMOTE_STEP),
+                ]
+            )
+            try:
+                output = _run_ssh_command(f"bash -lc {shlex.quote(command)}", timeout=600)
+                STATUS_CACHE.update()
+                lines = [line.strip() for line in output.splitlines() if line.strip()]
+                panel_dir = next((line for line in lines if line.startswith("/")), None)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "message": "Preview refreshed",
+                        "panel_dir": panel_dir,
+                        "output_tail": lines[-20:],
+                        "status": STATUS_CACHE.get(),
+                    }
+                )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=500)
 
     def log_message(self, format: str, *args: Any) -> None:
         return

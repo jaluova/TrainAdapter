@@ -24,6 +24,10 @@ DEFAULT_ORDINAL_KEYWORDS = (
 DEFAULT_MULTI_ENTITY_KEYWORDS = (
     ' and ', ' with ', ' between ', ' beside ', ' next to '
 )
+DEFAULT_COLOR_KEYWORDS = (
+    'red', 'blue', 'green', 'yellow', 'black', 'white',
+    'brown', 'orange', 'purple', 'pink', 'gray', 'grey'
+)
 
 
 def flatten_grid_points(grid_points):
@@ -107,6 +111,12 @@ def is_multi_entity_query(query, multi_entity_keywords=None):
     keywords = multi_entity_keywords or DEFAULT_MULTI_ENTITY_KEYWORDS
     lowered = f" {str(query).lower()} "
     return any(keyword in lowered for keyword in keywords)
+
+
+def is_color_query(query, color_keywords=None):
+    keywords = color_keywords or DEFAULT_COLOR_KEYWORDS
+    lowered = f" {str(query).lower()} "
+    return any(f" {keyword} " in lowered for keyword in keywords)
 
 
 def classify_query_difficulty(
@@ -291,6 +301,14 @@ def collate_fn_pad_batch(batch):
         [1 if item.get('is_relation_query', False) else 0 for item in batch],
         dtype=torch.bool
     )
+    color_flags = torch.tensor(
+        [1 if item.get('is_color_query', False) else 0 for item in batch],
+        dtype=torch.bool
+    )
+    gt_point_counts = torch.tensor(
+        [int(item.get('gt_point_count', len(item.get('gt_points', [])))) for item in batch],
+        dtype=torch.long
+    )
     image_ids = [item.get('image_id', '') for item in batch]
     
     images = [item['image'] for item in batch]
@@ -334,6 +352,8 @@ def collate_fn_pad_batch(batch):
         'query': queries,
         'instruction': instructions,
         'is_relation_query': relation_flags,
+        'is_color_query': color_flags,
+        'gt_point_count': gt_point_counts,
         'image_id': image_ids
     }
 
@@ -360,7 +380,8 @@ class CoordinateDataset(Dataset):
                  use_primary_grid_target=False,
                  relation_keywords=None,
                  ordinal_keywords=None,
-                 multi_entity_keywords=None):
+                 multi_entity_keywords=None,
+                 color_keywords=None):
         """
         Args:
             data_root: 数据根目录
@@ -388,6 +409,7 @@ class CoordinateDataset(Dataset):
         self.relation_keywords = tuple(relation_keywords or DEFAULT_RELATION_KEYWORDS)
         self.ordinal_keywords = tuple(ordinal_keywords or DEFAULT_ORDINAL_KEYWORDS)
         self.multi_entity_keywords = tuple(multi_entity_keywords or DEFAULT_MULTI_ENTITY_KEYWORDS)
+        self.color_keywords = tuple(color_keywords or DEFAULT_COLOR_KEYWORDS)
         
         # 加载分词器
         self.tokenizer = self._load_tokenizer(tokenizer_path)
@@ -455,7 +477,9 @@ class CoordinateDataset(Dataset):
                 'grid_points': grid_points,  # 真值坐标点
                 'grid_image_path': grid_image_path,
                 'index': idx,
-                'image_sample_count': image_counts.get(str(img_id), 1)
+                'image_sample_count': image_counts.get(str(img_id), 1),
+                'is_color_query': is_color_query(query, self.color_keywords),
+                'gt_point_count': len(flatten_grid_points(grid_points)),
             }
             sample['difficulty_tag'] = classify_query_difficulty(
                 sample,
@@ -484,10 +508,10 @@ class CoordinateDataset(Dataset):
             完整的指令文本
         """
         instruction_templates = [
-            f"Given the grid coordinate system, locate the referent described as '{query}' in the image and predict its target coordinates.",
-            f"Use the grid as spatial guidance to find '{query}' in the image and return the most likely target points.",
-            f"Locate '{query}' with the help of the image grid and predict the corresponding target coordinates.",
-            f"Identify where '{query}' is in the image according to the grid and output the most likely target points."
+            f"Locate the referent described as '{query}' in the image. Use the query attributes exactly, including color, count, and spatial relations, and predict all likely target grid points.",
+            f"Find '{query}' in the image using the grid. Match the text strictly, especially colors, relative position, and quantity, then return the most likely target points.",
+            f"Use the grid coordinate system to localize '{query}'. Pay close attention to color words, multi-object cues, and spatial descriptions, and output all likely target points.",
+            f"Identify where '{query}' is in the image. The prediction must follow the query exactly, including color and relation cues, and return the most likely target grid points."
         ]
         
         template = random.choice(instruction_templates)
@@ -607,10 +631,12 @@ class CoordinateDataset(Dataset):
             'instruction': instruction,
             'target_coordinate_mode': self.target_coordinate_mode,
             'is_relation_query': is_relation_query(sample['query'], self.relation_keywords),
+            'is_color_query': sample.get('is_color_query', is_color_query(sample['query'], self.color_keywords)),
             'is_ordinal_query': is_ordinal_query(sample['query'], self.ordinal_keywords),
             'is_multi_entity_query': is_multi_entity_query(sample['query'], self.multi_entity_keywords),
             'difficulty_tag': sample['difficulty_tag'],
             'image_sample_count': sample.get('image_sample_count', 1),
+            'gt_point_count': sample.get('gt_point_count', len(gt_points)),
             'image_id': sample['image_id']
         }
         
