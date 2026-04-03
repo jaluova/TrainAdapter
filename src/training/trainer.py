@@ -311,7 +311,7 @@ class CoordinateAdapterTrainer:
         return base_dataset.samples[base_idx], base_dataset, base_idx
 
     def _select_qualitative_indices(self, count=6):
-        """固定一组验证样本，至少优先覆盖关系词样本。"""
+        """固定一组更分散的验证样本，优先保证不同图片与不同难度类型。"""
         if self.val_dataloader is None or not hasattr(self.val_dataloader, 'dataset'):
             return []
 
@@ -320,37 +320,83 @@ class CoordinateAdapterTrainer:
             return []
 
         count = min(count, len(dataset))
-        relation_indices = []
-        non_relation_indices = []
+        buckets = {
+            'spatial_relation': [],
+            'ordinal': [],
+            'multi_entity': [],
+            'easy_salient': [],
+            'other': [],
+        }
+
         for idx in range(len(dataset)):
-            item = dataset[idx]
-            if item.get('is_relation_query', False):
-                relation_indices.append(idx)
+            sample_meta, _, _ = self._dataset_sample_meta(dataset, idx)
+            difficulty = sample_meta.get('difficulty_tag') or 'other'
+            if difficulty not in buckets:
+                difficulty = 'other'
+            buckets[difficulty].append((idx, sample_meta))
+
+        def pick_evenly_spaced(entries, desired_count, used_images, used_indices):
+            if desired_count <= 0 or not entries:
+                return []
+
+            available = [
+                (idx, meta) for idx, meta in entries
+                if idx not in used_indices and meta.get('image_id') not in used_images
+            ]
+            if not available:
+                available = [(idx, meta) for idx, meta in entries if idx not in used_indices]
+            if not available:
+                return []
+
+            desired_count = min(desired_count, len(available))
+            if desired_count >= len(available):
+                chosen = available
             else:
-                non_relation_indices.append(idx)
+                step = len(available) / float(desired_count)
+                chosen = []
+                for i in range(desired_count):
+                    pick_idx = min(int(i * step), len(available) - 1)
+                    chosen.append(available[pick_idx])
+
+            results = []
+            for idx, meta in chosen:
+                if idx in used_indices:
+                    continue
+                image_id = meta.get('image_id')
+                if image_id in used_images and any(m.get('image_id') != image_id for _, m in available):
+                    continue
+                used_indices.add(idx)
+                if image_id:
+                    used_images.add(image_id)
+                results.append(idx)
+            return results
 
         selected = []
-        desired_relation = min(3, count, len(relation_indices))
-        if desired_relation > 0:
-            step = max(len(relation_indices) / float(desired_relation), 1.0)
+        used_indices = set()
+        used_images = set()
+
+        preferred_order = ['spatial_relation', 'ordinal', 'multi_entity', 'easy_salient']
+        remaining_slots = count
+        non_empty_bucket_count = sum(1 for name in preferred_order if buckets[name])
+
+        for bucket_name in preferred_order:
+            entries = buckets[bucket_name]
+            if not entries or remaining_slots <= 0:
+                continue
+            target = 1 if non_empty_bucket_count >= remaining_slots else min(2, remaining_slots)
+            picked = pick_evenly_spaced(entries, target, used_images, used_indices)
+            selected.extend(picked)
+            remaining_slots = count - len(selected)
+
+        if len(selected) < count:
+            combined_pool = []
+            for bucket_name in preferred_order + ['other']:
+                combined_pool.extend(buckets[bucket_name])
             selected.extend(
-                relation_indices[min(int(round(i * step)), len(relation_indices) - 1)]
-                for i in range(desired_relation)
+                pick_evenly_spaced(combined_pool, count - len(selected), used_images, used_indices)
             )
 
-        remaining = count - len(selected)
-        pool = [idx for idx in range(len(dataset)) if idx not in selected]
-        if remaining > 0 and pool:
-            if remaining >= len(pool):
-                selected.extend(pool)
-            else:
-                step = max(len(pool) / float(remaining), 1.0)
-                selected.extend(
-                    pool[min(int(round(i * step)), len(pool) - 1)]
-                    for i in range(remaining)
-                )
-
-        return sorted(set(selected))
+        return sorted(selected[:count])
 
     def _load_font(self, size, bold=False):
         candidates = [
@@ -391,6 +437,30 @@ class CoordinateAdapterTrainer:
         font = self._load_font(18, bold=True)
         draw.text((x + radius + 3, y - radius - 3), label, fill=color, font=font)
 
+    def _build_grid_visual(self, original_img, border_size=28, grid_divisions=10):
+        """根据原图动态生成带网格底图，避免依赖可能错配的磁盘网格图。"""
+        width, height = original_img.size
+        canvas = Image.new('RGB', (width + border_size * 2, height + border_size * 2), 'white')
+        canvas.paste(original_img, (border_size, border_size))
+
+        draw = ImageDraw.Draw(canvas)
+        grid_color = '#94a3b8'
+        axis_color = '#475569'
+        label_font = self._load_font(14)
+
+        for i in range(grid_divisions + 1):
+            x = border_size + (width * i / grid_divisions)
+            y = border_size + (height * i / grid_divisions)
+            color = axis_color if i in (0, grid_divisions) else grid_color
+            line_width = 2 if i in (0, grid_divisions) else 1
+            draw.line([(x, border_size), (x, border_size + height)], fill=color, width=line_width)
+            draw.line([(border_size, y), (border_size + width, y)], fill=color, width=line_width)
+            if i < grid_divisions:
+                draw.text((x + 4, 6), str(i), fill=axis_color, font=label_font)
+                draw.text((6, y + 2), str(i), fill=axis_color, font=label_font)
+
+        return canvas
+
     def _save_qualitative_panel(self, step, panel_root='qualitative_panels', panel_title='Validation Qualitative Panel'):
         if self.val_dataloader is None or not self.qualitative_panel_indices:
             return None
@@ -428,14 +498,9 @@ class CoordinateAdapterTrainer:
                 image_id = sample_meta['image_id']
                 image_size = item['image_size']
                 original_path = os.path.join(base_dataset.data_root, base_dataset.image_dir, image_id)
-                grid_path = os.path.join(base_dataset.data_root, base_dataset.grid_image_dir, os.path.basename(sample_meta['grid_image_path']))
 
                 original_img = Image.open(original_path).convert('RGB')
-                if os.path.exists(grid_path):
-                    grid_img = Image.open(grid_path).convert('RGB')
-                else:
-                    grid_img = Image.new('RGB', (original_img.width + 56, original_img.height + 56), 'white')
-                    grid_img.paste(original_img, (28, 28))
+                grid_img = self._build_grid_visual(original_img)
 
                 gt_pixel_points = self._normalized_points_to_grid_pixels(item['gt_points'], image_size)
                 pred_pixel_points = self._normalized_points_to_grid_pixels([point for point, _ in ranked], image_size)
