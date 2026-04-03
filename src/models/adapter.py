@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .grid_encoder import GridEncoder, FeatureProjector
-from .cross_attention import CrossAttention, GatedFusion, ResidualFFN
+from .cross_attention import CrossAttention, TextGuidedCrossAttention, GatedFusion, ResidualFFN
 
 
 class AttentionPool(nn.Module):
@@ -64,7 +64,7 @@ class BaseCoordinateAdapter(nn.Module):
             output_dim=visual_dim,
             num_tokens=num_grid_tokens
         )
-        self.cross_attention = CrossAttention(
+        self.cross_attention = TextGuidedCrossAttention(
             dim=visual_dim,
             num_heads=num_heads,
             dropout=dropout
@@ -109,6 +109,12 @@ class BaseCoordinateAdapter(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1)
         )
+        # 2D位置编码: 让grid classifier知道每个logit对应的空间位置
+        self.grid_position_embedding = nn.Parameter(
+            torch.zeros(1, self.num_grid_logits, visual_dim)
+        )
+        nn.init.trunc_normal_(self.grid_position_embedding, std=0.02)
+
         self.grid_classifier = nn.Sequential(
             nn.LayerNorm(visual_dim),
             nn.Linear(visual_dim, hidden_dim),
@@ -136,12 +142,13 @@ class BaseCoordinateAdapter(nn.Module):
                 nn.init.constant_(module.weight, 1.0)
                 nn.init.constant_(module.bias, 0)
 
-    def forward(self, images, grid_images, visual_features):
+    def forward(self, images, grid_images, visual_features, text_features=None):
         grid_features_map = self.grid_encoder(grid_images)
         grid_tokens = self.grid_projector(grid_features_map)
         enhanced_features = self.cross_attention(
             visual_features=visual_features,
-            grid_features=grid_tokens
+            grid_features=grid_tokens,
+            text_features=text_features
         )
         fused_features = self.gated_fusion(visual_features, enhanced_features)
         return self.residual_ffn(fused_features)
@@ -178,23 +185,25 @@ class BaseCoordinateAdapter(nn.Module):
             attention_mask=attention_mask,
             visual_summary=visual_summary
         )
+        # token-level 文本条件化：每个视觉token独立地从文本token中提取相关信息
+        # 这让"左边"的信号可以选择性地增强左侧区域的token
         text_condition = self._build_text_conditioning(
             visual_features,
             text_features=text_features,
             attention_mask=attention_mask
         )
-        expanded_text_summary = text_summary.unsqueeze(1).expand(-1, visual_features.shape[1], -1)
 
+        # 融合视觉特征和token-level文本条件（不再广播池化向量）
         conditioned_tokens = (
             self.visual_condition_proj(visual_features) +
-            self.text_condition_proj(expanded_text_summary) +
+            self.text_condition_proj(text_condition) +
             text_condition
         )
         token_modulation = self.token_modulation(
-            torch.cat([visual_features, text_condition, expanded_text_summary], dim=-1)
+            torch.cat([visual_features, text_condition, text_condition], dim=-1)
         )
         text_gate = self.token_text_gate(
-            torch.cat([text_condition, expanded_text_summary], dim=-1)
+            torch.cat([text_condition, text_condition], dim=-1)
         )
         gate_scale, gate_bias = torch.chunk(text_gate, chunks=2, dim=-1)
         gate_scale = 0.5 * torch.tanh(gate_scale)
@@ -208,6 +217,15 @@ class BaseCoordinateAdapter(nn.Module):
         ).squeeze(-1)
         token_weights = torch.softmax(token_weight_logits, dim=1)
         grid_logits = torch.sum(token_logits * token_weights.unsqueeze(-1), dim=1)
+
+        # 用文本特征与位置编码的交互来产生空间偏置
+        # 这让模型能学到"左边"偏好小x、"右边"偏好大x等空间对应关系
+        pos_bias = torch.matmul(
+            text_summary.unsqueeze(1),  # [B, 1, D]
+            self.grid_position_embedding.transpose(-1, -2)  # [1, D, 121]
+        ).squeeze(1)  # [B, 121]
+        grid_logits = grid_logits + pos_bias
+
         return grid_logits
 
     def decode_grid_logits(self, grid_logits, top_k=None):
@@ -443,7 +461,7 @@ if __name__ == "__main__":
     attention_mask = torch.ones(B, L, dtype=torch.long)
 
     adapter = CoordinateAdapter(output_mode='grid_logits')
-    output_features = adapter(images, grid_images, visual_features)
+    output_features = adapter(images, grid_images, visual_features, text_features=text_features)
     grid_logits = adapter.predict_grid_logits(output_features, text_features, attention_mask)
     pred_points, pred_logits = adapter.predict_points(output_features, text_features, attention_mask)
 

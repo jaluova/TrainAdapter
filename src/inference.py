@@ -171,11 +171,11 @@ class CoordinateAdapterInference:
             if visual_features.dtype != adapter_dtype:
                 visual_features = visual_features.to(dtype=adapter_dtype)
 
-            enhanced_features = self.adapter(image_tensor, grid_image_tensor, visual_features)
-
             text_embeddings = self.qwen_model.encode_text(input_ids, attention_mask)
             if text_embeddings.dtype != adapter_dtype:
                 text_embeddings = text_embeddings.to(dtype=adapter_dtype)
+
+            enhanced_features = self.adapter(image_tensor, grid_image_tensor, visual_features, text_features=text_embeddings)
 
             if getattr(self.adapter, 'output_mode', 'point_regression') == 'grid_logits':
                 pred_grid_logits = self.adapter.predict_grid_logits(

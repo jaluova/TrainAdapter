@@ -173,11 +173,11 @@ def run_prediction(adapter, qwen_model, batch, device, top_k, dynamic_topk=False
         if visual_features.dtype != adapter_dtype:
             visual_features = visual_features.to(dtype=adapter_dtype)
 
-        enhanced_features = adapter(images, grid_images, visual_features)
-
         text_embeddings = qwen_model.encode_text(input_ids, attention_mask)
         if text_embeddings.dtype != adapter_dtype:
             text_embeddings = text_embeddings.to(dtype=adapter_dtype)
+
+        enhanced_features = adapter(images, grid_images, visual_features, text_features=text_embeddings)
 
         if getattr(adapter, "output_mode", "point_regression") == "grid_logits":
             pred_grid_logits = adapter.predict_grid_logits(

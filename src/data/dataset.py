@@ -15,18 +15,25 @@ GRID_DIVISIONS = 10.0
 DEFAULT_RELATION_KEYWORDS = (
     'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and',
     'center', 'middle', 'near', 'nearest', 'closest', 'far', 'furthest',
-    'first', 'second', 'third', 'fourth', 'last'
+    'first', 'second', 'third', 'fourth', 'last',
+    '左', '右', '上', '下', '前', '后', '之间', '旁边', '附近',
+    '中间', '中央', '靠近', '远离',
 )
 DEFAULT_ORDINAL_KEYWORDS = (
     'first', 'second', 'third', 'fourth', 'fifth', 'last',
-    'leftmost', 'rightmost', 'furthest', 'nearest'
+    'leftmost', 'rightmost', 'furthest', 'nearest',
+    '第一', '第二', '第三', '第四', '第五', '最后',
+    '最左', '最右', '最远', '最近',
 )
 DEFAULT_MULTI_ENTITY_KEYWORDS = (
-    ' and ', ' with ', ' between ', ' beside ', ' next to '
+    ' and ', ' with ', ' between ', ' beside ', ' next to ',
+    '和', '与', '之间', '旁边', '边上',
 )
 DEFAULT_COLOR_KEYWORDS = (
     'red', 'blue', 'green', 'yellow', 'black', 'white',
-    'brown', 'orange', 'purple', 'pink', 'gray', 'grey'
+    'brown', 'orange', 'purple', 'pink', 'gray', 'grey',
+    '红', '蓝', '绿', '黄', '黑', '白',
+    '棕', '橙', '紫', '粉', '灰',
 )
 
 
@@ -305,6 +312,10 @@ def collate_fn_pad_batch(batch):
         [1 if item.get('is_color_query', False) else 0 for item in batch],
         dtype=torch.bool
     )
+    ordinal_flags = torch.tensor(
+        [1 if item.get('is_ordinal_query', False) else 0 for item in batch],
+        dtype=torch.bool
+    )
     gt_point_counts = torch.tensor(
         [int(item.get('gt_point_count', len(item.get('gt_points', [])))) for item in batch],
         dtype=torch.long
@@ -353,6 +364,7 @@ def collate_fn_pad_batch(batch):
         'instruction': instructions,
         'is_relation_query': relation_flags,
         'is_color_query': color_flags,
+        'is_ordinal_query': ordinal_flags,
         'gt_point_count': gt_point_counts,
         'image_id': image_ids
     }
@@ -381,7 +393,8 @@ class CoordinateDataset(Dataset):
                  relation_keywords=None,
                  ordinal_keywords=None,
                  multi_entity_keywords=None,
-                 color_keywords=None):
+                 color_keywords=None,
+                 filter_ordinal_queries=False):
         """
         Args:
             data_root: 数据根目录
@@ -392,6 +405,7 @@ class CoordinateDataset(Dataset):
             image_size: 图像尺寸
             max_length: 文本最大长度
             transform: 图像变换
+            filter_ordinal_queries: 过滤顺序查询（gRefCOCO标注存在系统性错误）
         """
         self.data_root = data_root
         self.image_dir = image_dir
@@ -406,6 +420,7 @@ class CoordinateDataset(Dataset):
         self.grid_size = grid_size
         self.neighbor_soft_label_weight = neighbor_soft_label_weight
         self.use_primary_grid_target = use_primary_grid_target
+        self.filter_ordinal_queries = filter_ordinal_queries
         self.relation_keywords = tuple(relation_keywords or DEFAULT_RELATION_KEYWORDS)
         self.ordinal_keywords = tuple(ordinal_keywords or DEFAULT_ORDINAL_KEYWORDS)
         self.multi_entity_keywords = tuple(multi_entity_keywords or DEFAULT_MULTI_ENTITY_KEYWORDS)
@@ -492,7 +507,11 @@ class CoordinateDataset(Dataset):
             image_path = os.path.join(self.data_root, self.image_dir, sample['image_id'])
             if not os.path.exists(image_path):
                 continue
-                
+
+            # 过滤顺序查询：gRefCOCO标注在顺序查询上存在系统性错误
+            if self.filter_ordinal_queries and sample['difficulty_tag'] == 'ordinal':
+                continue
+
             samples.append(sample)
         
         return samples

@@ -209,13 +209,37 @@ class CoordinateAdapterTrainer:
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr_value
 
+    @staticmethod
+    def _migrate_checkpoint_keys(state_dict):
+        """
+        兼容旧checkpoint: 将旧的 cross_attention.* key 映射到
+        新的 cross_attention.grid_cross_attn.* ，让旧权重能被复用。
+        """
+        migrated = {}
+        remapped_count = 0
+        for key, value in state_dict.items():
+            # 旧: cross_attention.q_proj.weight
+            # 新: cross_attention.grid_cross_attn.q_proj.weight
+            if key.startswith('cross_attention.') and '.grid_cross_attn.' not in key and '.text_cross_attn.' not in key and '.merge_gate.' not in key:
+                new_key = key.replace('cross_attention.', 'cross_attention.grid_cross_attn.', 1)
+                migrated[new_key] = value
+                remapped_count += 1
+            else:
+                migrated[key] = value
+        return migrated, remapped_count
+
     def load_checkpoint(self, checkpoint_path, resume_as_init=False):
         """加载检查点"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
+        model_state = checkpoint['model_state_dict']
+        model_state, remapped_count = self._migrate_checkpoint_keys(model_state)
+        if remapped_count > 0:
+            self.logger.info(f"Migrated {remapped_count} old cross_attention keys to grid_cross_attn")
+
         strict = not resume_as_init
         missing_keys, unexpected_keys = self.adapter.load_state_dict(
-            checkpoint['model_state_dict'],
+            model_state,
             strict=strict
         )
         if missing_keys:
@@ -660,13 +684,11 @@ class CoordinateAdapterTrainer:
                 visual_features = self.qwen_model.encode_image(images)
                 if visual_features.dtype != adapter_dtype:
                     visual_features = visual_features.to(dtype=adapter_dtype)
-
-            enhanced_features = self.adapter(images, grid_images, visual_features)
-
-            with torch.no_grad():
                 text_embeddings = self.qwen_model.encode_text(input_ids, attention_mask)
                 if text_embeddings.dtype != adapter_dtype:
                     text_embeddings = text_embeddings.to(dtype=adapter_dtype)
+
+            enhanced_features = self.adapter(images, grid_images, visual_features, text_features=text_embeddings)
 
             if getattr(self.adapter, 'output_mode', 'point_regression') == 'grid_logits':
                 pred_grid_logits = self.adapter.predict_grid_logits(
@@ -731,6 +753,7 @@ class CoordinateAdapterTrainer:
         for sample_idx, info in enumerate(match_info):
             info['is_relation_query'] = bool(batch['is_relation_query'][sample_idx].item())
             info['is_color_query'] = bool(batch['is_color_query'][sample_idx].item())
+            info['is_ordinal_query'] = bool(batch.get('is_ordinal_query', torch.zeros(len(match_info), dtype=torch.bool))[sample_idx].item())
             info['query'] = batch['query'][sample_idx]
             info['image_id'] = batch['image_id'][sample_idx]
             info['gt_point_count'] = int(batch['gt_point_count'][sample_idx].item())
@@ -790,10 +813,11 @@ class CoordinateAdapterTrainer:
                 for sample_idx, info in enumerate(match_info):
                     info['is_relation_query'] = bool(batch['is_relation_query'][sample_idx].item())
                     info['is_color_query'] = bool(batch['is_color_query'][sample_idx].item())
+                    info['is_ordinal_query'] = bool(batch.get('is_ordinal_query', torch.zeros(len(match_info), dtype=torch.bool))[sample_idx].item())
                     info['query'] = batch['query'][sample_idx]
                     info['image_id'] = batch['image_id'][sample_idx]
                     info['gt_point_count'] = int(batch['gt_point_count'][sample_idx].item())
-                
+
                 total_loss += loss.item()
                 total_samples += len(batch['image'])
                 all_match_info.extend(match_info)
@@ -825,6 +849,8 @@ class CoordinateAdapterTrainer:
         relation_count = 0
         color_acc_top4 = 0
         color_count = 0
+        ordinal_acc_top4 = 0
+        ordinal_count = 0
         gt_coverage_topk_sum = 0.0
         total_samples = 0
 
@@ -853,6 +879,9 @@ class CoordinateAdapterTrainer:
             if info.get('is_color_query', False):
                 color_count += 1
                 color_acc_top4 += int(top4_hit)
+            if info.get('is_ordinal_query', False):
+                ordinal_count += 1
+                ordinal_acc_top4 += int(top4_hit)
 
         metrics = {
             'mean_min_grid_distance': float(np.mean(all_min_distances)) if all_min_distances else 0.0,
@@ -860,10 +889,12 @@ class CoordinateAdapterTrainer:
             'acc_top4': acc_top4 / total_samples if total_samples > 0 else 0.0,
             'relation_acc_top4': relation_acc_top4 / relation_count if relation_count > 0 else 0.0,
             'color_acc_top4': color_acc_top4 / color_count if color_count > 0 else 0.0,
+            'ordinal_acc_top4': ordinal_acc_top4 / ordinal_count if ordinal_count > 0 else 0.0,
             'gt_coverage_topk': gt_coverage_topk_sum / total_samples if total_samples > 0 else 0.0,
             'total_samples': total_samples,
             'relation_samples': relation_count,
             'color_samples': color_count,
+            'ordinal_samples': ordinal_count,
         }
 
         metrics['l1_error'] = metrics['mean_min_grid_distance']
@@ -942,6 +973,7 @@ class CoordinateAdapterTrainer:
                                 f"Acc@Top4: {metrics['acc_top4']:.2%}, "
                                 f"Relation Acc@Top4: {metrics['relation_acc_top4']:.2%}, "
                                 f"Color Acc@Top4: {metrics['color_acc_top4']:.2%}, "
+                                f"Ordinal Acc@Top4: {metrics['ordinal_acc_top4']:.2%}, "
                                 f"GT Coverage@Top4: {metrics['gt_coverage_topk']:.2%}"
                             )
                             if metrics.get('qualitative_panel_dir'):

@@ -267,7 +267,8 @@ def create_dataloaders(config, train_transform, val_transform):
         relation_keywords=config.data.relation_keywords,
         ordinal_keywords=config.data.ordinal_keywords,
         multi_entity_keywords=config.data.multi_entity_keywords,
-        color_keywords=config.data.color_keywords
+        color_keywords=config.data.color_keywords,
+        filter_ordinal_queries=config.data.filter_ordinal_queries
     )
 
     train_dataset = full_dataset
@@ -302,7 +303,8 @@ def create_dataloaders(config, train_transform, val_transform):
                 relation_keywords=config.data.relation_keywords,
                 ordinal_keywords=config.data.ordinal_keywords,
                 multi_entity_keywords=config.data.multi_entity_keywords,
-                color_keywords=config.data.color_keywords
+                color_keywords=config.data.color_keywords,
+                filter_ordinal_queries=config.data.filter_ordinal_queries
             )
             val_dataset = Subset(val_base_dataset, val_indices)
 
@@ -326,7 +328,8 @@ def create_dataloaders(config, train_transform, val_transform):
             relation_keywords=config.data.relation_keywords,
             ordinal_keywords=config.data.ordinal_keywords,
             multi_entity_keywords=config.data.multi_entity_keywords,
-            color_keywords=config.data.color_keywords
+            color_keywords=config.data.color_keywords,
+            filter_ordinal_queries=config.data.filter_ordinal_queries
         )
 
     def _get_train_samples(dataset):

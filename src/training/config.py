@@ -74,25 +74,35 @@ class DataConfig:
     relation_keywords: tuple = (
         'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and',
         'center', 'middle', 'near', 'nearest', 'closest', 'far', 'furthest',
-        'first', 'second', 'third', 'fourth', 'last'
+        'first', 'second', 'third', 'fourth', 'last',
+        '左', '右', '上', '下', '前', '后', '之间', '旁边', '附近',
+        '中间', '中央', '靠近', '远离',
     )
     ordinal_keywords: tuple = (
         'first', 'second', 'third', 'fourth', 'fifth', 'last',
-        'leftmost', 'rightmost', 'furthest', 'nearest'
+        'leftmost', 'rightmost', 'furthest', 'nearest',
+        '第一', '第二', '第三', '第四', '第五', '最后',
+        '最左', '最右', '最远', '最近',
     )
     multi_entity_keywords: tuple = (
-        ' and ', ' with ', ' between ', ' beside ', ' next to '
+        ' and ', ' with ', ' between ', ' beside ', ' next to ',
+        '和', '与', '之间', '旁边', '边上',
     )
     color_keywords: tuple = (
         'red', 'blue', 'green', 'yellow', 'black', 'white',
-        'brown', 'orange', 'purple', 'pink', 'gray', 'grey'
+        'brown', 'orange', 'purple', 'pink', 'gray', 'grey',
+        '红', '蓝', '绿', '黄', '黑', '白',
+        '棕', '橙', '紫', '粉', '灰',
     )
     difficulty_oversample: bool = True
     spatial_query_weight: float = 1.8
     ordinal_query_weight: float = 2.2
     multi_entity_query_weight: float = 2.0
     multi_query_image_weight: float = 1.3
-    
+
+    # 顺序查询过滤（gRefCOCO标注在顺序查询上有系统性错误）
+    filter_ordinal_queries: bool = True
+
     # 负样本
     use_negative_samples: bool = False
     negative_sample_ratio: float = 0.2

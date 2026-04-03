@@ -92,6 +92,35 @@ class CrossAttention(nn.Module):
         return output
 
 
+class TextGuidedCrossAttention(nn.Module):
+    """
+    文本引导的跨注意力：在视觉×网格注意力基础上，增加视觉×文本注意力分支。
+    让空间特征融合阶段就能感知"红色""左边"等语义。
+    """
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.grid_cross_attn = CrossAttention(dim=dim, num_heads=num_heads, dropout=dropout)
+        self.text_cross_attn = CrossAttention(dim=dim, num_heads=num_heads, dropout=dropout)
+        # 门控：决定每个视觉token应更多地信任网格还是文本增强
+        self.merge_gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, visual_features, grid_features, text_features=None, text_attention_mask=None):
+        # 网格分支：视觉特征通过网格特征增强（已含残差+LayerNorm）
+        grid_enhanced = self.grid_cross_attn(visual_features, grid_features)
+
+        if text_features is None:
+            return grid_enhanced
+
+        # 文本分支：视觉特征通过文本特征增强（已含残差+LayerNorm）
+        text_enhanced = self.text_cross_attn(visual_features, text_features)
+        # 门控融合两个分支
+        gate = self.merge_gate(torch.cat([grid_enhanced, text_enhanced], dim=-1))
+        return gate * text_enhanced + (1 - gate) * grid_enhanced
+
+
 class GatedFusion(nn.Module):
     """
     门控自适应融合机制：自适应平衡原始特征和增强特征
