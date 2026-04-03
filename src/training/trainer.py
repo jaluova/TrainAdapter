@@ -323,6 +323,8 @@ class CoordinateAdapterTrainer:
 
         count = min(count, len(dataset))
         buckets = {
+            'color_query': [],
+            'multi_target': [],
             'spatial_relation': [],
             'ordinal': [],
             'multi_entity': [],
@@ -332,6 +334,13 @@ class CoordinateAdapterTrainer:
 
         for idx in range(len(dataset)):
             sample_meta, _, _ = self._dataset_sample_meta(dataset, idx)
+            gt_point_count = int(sample_meta.get('gt_point_count', 0))
+            if sample_meta.get('is_color_query', False):
+                buckets['color_query'].append((idx, sample_meta))
+                continue
+            if gt_point_count > 1:
+                buckets['multi_target'].append((idx, sample_meta))
+                continue
             difficulty = sample_meta.get('difficulty_tag') or 'other'
             if difficulty not in buckets:
                 difficulty = 'other'
@@ -379,15 +388,24 @@ class CoordinateAdapterTrainer:
         used_indices = set()
         used_images = set()
 
-        preferred_order = ['spatial_relation', 'ordinal', 'multi_entity', 'easy_salient']
+        preferred_order = ['color_query', 'multi_target', 'spatial_relation', 'ordinal', 'multi_entity', 'easy_salient']
         remaining_slots = count
         non_empty_bucket_count = sum(1 for name in preferred_order if buckets[name])
+        bucket_targets = {
+            'color_query': 2,
+            'multi_target': 2,
+            'spatial_relation': 1,
+            'ordinal': 1,
+            'multi_entity': 1,
+            'easy_salient': 1,
+        }
 
         for bucket_name in preferred_order:
             entries = buckets[bucket_name]
             if not entries or remaining_slots <= 0:
                 continue
-            target = 1 if non_empty_bucket_count >= remaining_slots else min(2, remaining_slots)
+            preferred_target = bucket_targets.get(bucket_name, 1)
+            target = 1 if non_empty_bucket_count >= remaining_slots else min(preferred_target, remaining_slots)
             picked = pick_evenly_spaced(
                 entries,
                 target,
@@ -517,6 +535,7 @@ class CoordinateAdapterTrainer:
             'panel_root': panel_root,
             'panel_title': panel_title,
             'rotation_round': self.qualitative_panel_rotation,
+            'sample_tags': [],
         }
 
         title_font = self._load_font(26, bold=True)
@@ -545,7 +564,7 @@ class CoordinateAdapterTrainer:
 
                 panel_gap = 30
                 header_h = 140
-                footer_h = 130
+                footer_h = 170
                 canvas_w = original_img.width + grid_img.width + panel_gap * 3
                 canvas_h = max(original_img.height, grid_img.height) + header_h + footer_h
                 canvas = Image.new('RGB', (canvas_w, canvas_h), '#f5f7fb')
@@ -554,6 +573,15 @@ class CoordinateAdapterTrainer:
                 draw.text((30, 20), panel_title, fill="#18212f", font=title_font)
                 draw.text((30, 56), f"Image: {image_id}", fill="#334155", font=body_font)
                 draw.text((30, 84), f"Query: {item['query']}", fill="#1f2937", font=body_font)
+                tag_parts = []
+                if item.get('is_color_query', False):
+                    tag_parts.append("color")
+                if int(item.get('gt_point_count', len(item['gt_points']))) > 1:
+                    tag_parts.append("multi-target")
+                if item.get('is_relation_query', False):
+                    tag_parts.append("relation")
+                if tag_parts:
+                    draw.text((30, 110), f"Tags: {', '.join(tag_parts)}", fill="#475569", font=small_font)
 
                 left_x = panel_gap
                 top_y = header_h
@@ -577,9 +605,21 @@ class CoordinateAdapterTrainer:
                 draw.text((50, footer_y + 18), "Readout", fill="#162033", font=body_font)
                 draw.text((50, footer_y + 50), "Blue dots are target grid points; red circles are top confidence predictions decoded from grid logits.", fill="#334155", font=small_font)
                 draw.text((50, footer_y + 74), "Scores come from sigmoid(top-k logits); training and evaluation both operate in normalized grid coordinates.", fill="#334155", font=small_font)
+                draw.text((50, footer_y + 98), f"GT points: {int(item.get('gt_point_count', len(item['gt_points'])))} | selection: fixed_topk", fill="#334155", font=small_font)
 
                 output_prefix = os.path.join(panel_dir, f"sample_{sample_idx:04d}_{image_id}")
                 canvas.save(f"{output_prefix}.png")
+                sample_tags = {
+                    'difficulty_tag': item.get('difficulty_tag'),
+                    'is_color_query': bool(item.get('is_color_query', False)),
+                    'is_relation_query': bool(item.get('is_relation_query', False)),
+                    'gt_point_count': int(item.get('gt_point_count', len(item['gt_points']))),
+                }
+                manifest['sample_tags'].append({
+                    'sample_idx': sample_idx,
+                    'image_id': image_id,
+                    **sample_tags,
+                })
                 with open(f"{output_prefix}.json", 'w', encoding='utf-8') as f:
                     json.dump({
                         'image_id': image_id,
@@ -588,6 +628,10 @@ class CoordinateAdapterTrainer:
                         'ground_truth_points_normalized': item['gt_points'],
                         'predicted_points_normalized': [[round(float(x), 4), round(float(y), 4)] for x, y in [point for point, _ in ranked]],
                         'prediction_scores': [round(float(score), 4) for _, score in ranked],
+                        'selection_mode': 'fixed_topk',
+                        'is_color_query': bool(item.get('is_color_query', False)),
+                        'gt_point_count': int(item.get('gt_point_count', len(item['gt_points']))),
+                        'difficulty_tag': item.get('difficulty_tag'),
                     }, f, ensure_ascii=False, indent=2)
 
         with open(os.path.join(panel_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
@@ -686,8 +730,10 @@ class CoordinateAdapterTrainer:
 
         for sample_idx, info in enumerate(match_info):
             info['is_relation_query'] = bool(batch['is_relation_query'][sample_idx].item())
+            info['is_color_query'] = bool(batch['is_color_query'][sample_idx].item())
             info['query'] = batch['query'][sample_idx]
             info['image_id'] = batch['image_id'][sample_idx]
+            info['gt_point_count'] = int(batch['gt_point_count'][sample_idx].item())
 
         if self.use_amp:
             self.scaler.scale(loss).backward()
@@ -743,8 +789,10 @@ class CoordinateAdapterTrainer:
 
                 for sample_idx, info in enumerate(match_info):
                     info['is_relation_query'] = bool(batch['is_relation_query'][sample_idx].item())
+                    info['is_color_query'] = bool(batch['is_color_query'][sample_idx].item())
                     info['query'] = batch['query'][sample_idx]
                     info['image_id'] = batch['image_id'][sample_idx]
+                    info['gt_point_count'] = int(batch['gt_point_count'][sample_idx].item())
                 
                 total_loss += loss.item()
                 total_samples += len(batch['image'])
@@ -775,6 +823,9 @@ class CoordinateAdapterTrainer:
         acc_top4 = 0
         relation_acc_top4 = 0
         relation_count = 0
+        color_acc_top4 = 0
+        color_count = 0
+        gt_coverage_topk_sum = 0.0
         total_samples = 0
 
         for info in match_info:
@@ -794,18 +845,25 @@ class CoordinateAdapterTrainer:
             top4_hit = bool((distances[:min(4, len(pred_points))] < 1e-6).any())
             acc_1grid += int(top1_hit)
             acc_top4 += int(top4_hit)
+            gt_coverage_topk_sum += float(info.get('gt_coverage_topk', 0.0))
 
             if info.get('is_relation_query', False):
                 relation_count += 1
                 relation_acc_top4 += int(top4_hit)
+            if info.get('is_color_query', False):
+                color_count += 1
+                color_acc_top4 += int(top4_hit)
 
         metrics = {
             'mean_min_grid_distance': float(np.mean(all_min_distances)) if all_min_distances else 0.0,
             'acc_1grid': acc_1grid / total_samples if total_samples > 0 else 0.0,
             'acc_top4': acc_top4 / total_samples if total_samples > 0 else 0.0,
             'relation_acc_top4': relation_acc_top4 / relation_count if relation_count > 0 else 0.0,
+            'color_acc_top4': color_acc_top4 / color_count if color_count > 0 else 0.0,
+            'gt_coverage_topk': gt_coverage_topk_sum / total_samples if total_samples > 0 else 0.0,
             'total_samples': total_samples,
             'relation_samples': relation_count,
+            'color_samples': color_count,
         }
 
         metrics['l1_error'] = metrics['mean_min_grid_distance']
@@ -882,7 +940,9 @@ class CoordinateAdapterTrainer:
                                 f"Mean Min Grid Distance: {metrics['mean_min_grid_distance']:.4f}, "
                                 f"Acc@1Grid: {metrics['acc_1grid']:.2%}, "
                                 f"Acc@Top4: {metrics['acc_top4']:.2%}, "
-                                f"Relation Acc@Top4: {metrics['relation_acc_top4']:.2%}"
+                                f"Relation Acc@Top4: {metrics['relation_acc_top4']:.2%}, "
+                                f"Color Acc@Top4: {metrics['color_acc_top4']:.2%}, "
+                                f"GT Coverage@Top4: {metrics['gt_coverage_topk']:.2%}"
                             )
                             if metrics.get('qualitative_panel_dir'):
                                 self.logger.info(f"Saved qualitative panel to {metrics['qualitative_panel_dir']}")

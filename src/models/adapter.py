@@ -94,6 +94,13 @@ class BaseCoordinateAdapter(nn.Module):
             nn.Linear(hidden_dim, visual_dim),
             nn.Sigmoid()
         )
+        self.token_text_gate = nn.Sequential(
+            nn.LayerNorm(visual_dim * 2),
+            nn.Linear(visual_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, visual_dim * 2)
+        )
         self.token_score = nn.Linear(visual_dim, 1)
         self.token_text_score = nn.Sequential(
             nn.LayerNorm(visual_dim * 2),
@@ -186,7 +193,14 @@ class BaseCoordinateAdapter(nn.Module):
         token_modulation = self.token_modulation(
             torch.cat([visual_features, text_condition, expanded_text_summary], dim=-1)
         )
+        text_gate = self.token_text_gate(
+            torch.cat([text_condition, expanded_text_summary], dim=-1)
+        )
+        gate_scale, gate_bias = torch.chunk(text_gate, chunks=2, dim=-1)
+        gate_scale = 0.5 * torch.tanh(gate_scale)
+        gate_bias = 0.25 * torch.tanh(gate_bias)
         conditioned_tokens = F.gelu(conditioned_tokens) * (1.0 + token_modulation)
+        conditioned_tokens = conditioned_tokens * (1.0 + gate_scale) + gate_bias
         token_logits = self.grid_classifier(conditioned_tokens)
         token_weight_logits = self.token_score(conditioned_tokens).squeeze(-1)
         token_weight_logits = token_weight_logits + self.token_text_score(

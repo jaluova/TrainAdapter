@@ -431,7 +431,10 @@ def render_visual(sample, pred_points, pred_logits, output_path, top_k, selectio
         "selected_indices": selection_meta.get("selected_indices"),
         "selected_scores": [round(float(score), 4) for score in selection_meta.get("selected_scores", pred_scores)],
         "candidate_scores": [round(float(score), 4) for score in selection_meta.get("candidate_scores", scores)],
-        "selected_points_normalized": [[round(float(x), 4), round(float(y), 4)] for x, y in pred_norm_points]
+        "selected_points_normalized": [[round(float(x), 4), round(float(y), 4)] for x, y in pred_norm_points],
+        "is_color_query": bool(sample.get("is_color_query", False)),
+        "gt_point_count": int(sample.get("gt_point_count", len(gt_grid_points))),
+        "difficulty_tag": sample.get("difficulty_tag"),
     }
     with open(str(Path(output_path).with_suffix(".json")), "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -507,6 +510,9 @@ def main():
             "image_size": item["image_size"],
             "data_root": config.data.data_root,
             "grid_image_path": sample_meta.get("grid_image_path", sample_meta["image_id"]),
+            "is_color_query": bool(item.get("is_color_query", False)),
+            "gt_point_count": int(item.get("gt_point_count", len(item["gt_points"]))),
+            "difficulty_tag": item.get("difficulty_tag"),
         }
         output_path = output_dir / f"sample_{sample_idx:04d}_{sample_meta['image_id']}"
         display_top_k = selection_meta.get("selected_k", args.top_k) if args.dynamic_topk else args.top_k

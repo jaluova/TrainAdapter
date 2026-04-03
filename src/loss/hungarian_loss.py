@@ -334,9 +334,11 @@ class HungarianPointLoss(nn.Module):
 
             pos_logits = pred_grid_logits[batch_idx, pos_indices]
             neg_logits = pred_grid_logits[batch_idx, neg_indices]
-            hardest_negative = neg_logits.max()
-            hardest_positive = pos_logits.max()
-            sample_loss = F.relu(self.ranking_margin - hardest_positive + hardest_negative)
+            hardest_negative_count = min(max(1, pos_logits.numel()), neg_logits.numel())
+            hardest_negatives = torch.topk(neg_logits, k=hardest_negative_count, largest=True).values
+            pos_matrix = pos_logits.unsqueeze(1)
+            neg_matrix = hardest_negatives.unsqueeze(0)
+            sample_loss = F.relu(self.ranking_margin - pos_matrix + neg_matrix).mean()
             losses.append(sample_loss)
 
         if not losses:
@@ -374,8 +376,13 @@ class HungarianPointLoss(nn.Module):
                 if gt_points else pred_points.new_zeros((0, 2))
             )
             min_grid_distance = None
+            gt_coverage_topk = 0.0
             if gt_tensor.numel() > 0:
-                min_grid_distance = torch.cdist(pred_points[batch_idx], gt_tensor, p=2).min().item()
+                distances = torch.cdist(pred_points[batch_idx], gt_tensor, p=2)
+                min_grid_distance = distances.min().item()
+                top_k_distances = distances[:min(top_k, pred_points.shape[1])]
+                covered_gt = (top_k_distances < 1e-6).any(dim=0).float().mean().item()
+                gt_coverage_topk = float(covered_gt)
 
             match_info.append({
                 'pred_points': pred_points[batch_idx].detach().cpu().tolist(),
@@ -385,7 +392,8 @@ class HungarianPointLoss(nn.Module):
                 'coordinate_mode': 'normalized_grid',
                 'loss_type': 'bce_grid',
                 'min_grid_distance': min_grid_distance,
-                'ranking_loss': float(ranking_loss.detach().cpu())
+                'ranking_loss': float(ranking_loss.detach().cpu()),
+                'gt_coverage_topk': gt_coverage_topk
             })
 
         return total_loss, match_info
