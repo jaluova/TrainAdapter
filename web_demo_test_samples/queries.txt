@@ -1,6 +1,0 @@
-COCO_train2014_000000000072.jpg | giraffe on left
-COCO_train2014_000000059138.jpg | Man in center and guy furthest left
-COCO_train2014_000000120333.jpg | rightest black and white van
-COCO_train2014_000000182377.jpg | commode on right
-COCO_train2014_000000244016.jpg | 1st one and rt ele
-COCO_train2014_000000305431.jpg | cow to left and partial cow bottom right corner
