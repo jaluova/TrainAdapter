@@ -1,0 +1,13 @@
+{
+  "framework": "pytorch",
+  "task": "visual-grounding",
+  "model": {
+    "type": "gridground-textguided-adapter",
+    "backbone": "Qwen2.5-VL-7B-Instruct",
+    "output_mode": "grid_logits",
+    "grid_size": 11
+  },
+  "pipeline": {
+    "type": "visual-grounding"
+  }
+}
