@@ -29,3 +29,6 @@ artifacts/
 *.log
 *.out
 *.pth
+
+
+*html
