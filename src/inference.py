@@ -77,6 +77,38 @@ class CoordinateAdapterInference:
                     pass
         return ImageFont.load_default()
 
+    def build_grid_image(self, image):
+        """
+        为在线推理动态生成和训练数据风格一致的网格图。
+        """
+        image = image.convert('RGB')
+        width, height = image.size
+        border_size = 28
+
+        new_width = width + border_size * 2
+        new_height = height + border_size * 2
+        grid_image = Image.new('RGB', (new_width, new_height), 'white')
+        grid_image.paste(image, (border_size, border_size))
+
+        draw = ImageDraw.Draw(grid_image)
+        grid_font = self._load_font(15, bold=False)
+
+        for i in range(11):
+            x = border_size + i * (width / 10.0)
+            y = border_size + i * (height / 10.0)
+
+            draw.line([(x, border_size), (x, border_size + height)], fill='black', width=1)
+            draw.line([(border_size, y), (border_size + width, y)], fill='black', width=1)
+
+            label = str(i)
+            bbox = draw.textbbox((0, 0), label, font=grid_font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            draw.text((x - text_w / 2, border_size - text_h - 5), label, fill='black', font=grid_font)
+            draw.text((border_size - text_w - 5, y - text_h / 2), label, fill='black', font=grid_font)
+
+        return grid_image
+
     def _load_adapter_weights(self, adapter_path):
         """加载Adapter权重。"""
         if not os.path.exists(adapter_path):
@@ -133,7 +165,8 @@ class CoordinateAdapterInference:
             grid_image = grid_image.convert('RGB')
             grid_image_tensor = self.transform(grid_image).unsqueeze(0).to(self.device)
         else:
-            grid_image_tensor = image_tensor.clone()
+            generated_grid_image = self.build_grid_image(image)
+            grid_image_tensor = self.transform(generated_grid_image).unsqueeze(0).to(self.device)
 
         return image_tensor, grid_image_tensor, original_size
 

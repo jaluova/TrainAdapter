@@ -1,0 +1,32 @@
+[
+  {
+    "file_name": "COCO_train2014_000000000072.jpg",
+    "query": "giraffe on left",
+    "tags": ["relation"]
+  },
+  {
+    "file_name": "COCO_train2014_000000000110.jpg",
+    "query": "girl in very center with red coat on chair",
+    "tags": ["color"]
+  },
+  {
+    "file_name": "COCO_train2014_000000000165.jpg",
+    "query": "two people",
+    "tags": ["multi"]
+  },
+  {
+    "file_name": "COCO_train2014_000000000113.jpg",
+    "query": "lady cutting the cake",
+    "tags": []
+  },
+  {
+    "file_name": "COCO_train2014_000000000144.jpg",
+    "query": "giraffe on the left",
+    "tags": ["relation"]
+  },
+  {
+    "file_name": "COCO_train2014_000000000201.jpg",
+    "query": "skiboard second from the right",
+    "tags": ["relation"]
+  }
+]

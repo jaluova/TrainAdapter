@@ -1,0 +1,1 @@
+{"base_remote_path": "/root/autodl-tmp/Data/train_outputs/textguided_localsync_20260405_4epoch/config.json", "save_dir": "/root/autodl-tmp/Data/train_outputs/textguided_recover_20260405_shortval", "resume": "/root/autodl-tmp/Data/train_outputs/textguided_resume_from_multitarget_20260403/checkpoints/best_model.pth"}
