@@ -264,11 +264,14 @@ def create_dataloaders(config, train_transform, val_transform):
         grid_size=config.model.grid_size,
         neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
         use_primary_grid_target=config.training.use_primary_grid_target,
+        gaussian_sigma=config.training.grid_target_gaussian_sigma,
         relation_keywords=config.data.relation_keywords,
         ordinal_keywords=config.data.ordinal_keywords,
         multi_entity_keywords=config.data.multi_entity_keywords,
         color_keywords=config.data.color_keywords,
-        filter_ordinal_queries=config.data.filter_ordinal_queries
+        filter_ordinal_queries=config.data.filter_ordinal_queries,
+        horizontal_flip=config.data.horizontal_flip,
+        color_jitter=config.data.color_jitter
     )
 
     train_dataset = full_dataset
@@ -557,7 +560,8 @@ def main():
         grid_pos_weight=config.training.grid_pos_weight,
         neighbor_soft_label_weight=config.training.neighbor_soft_label_weight,
         ranking_margin=config.training.ranking_margin,
-        ranking_loss_weight=config.training.ranking_loss_weight
+        ranking_loss_weight=config.training.ranking_loss_weight,
+        focal_gamma=config.training.focal_gamma
     )
     
     # 创建优化器和调度器

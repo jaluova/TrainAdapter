@@ -27,9 +27,10 @@ class HungarianPointLoss(nn.Module):
                  grid_pos_weight=4.0,
                  neighbor_soft_label_weight=0.3,
                  ranking_margin=0.2,
-                 ranking_loss_weight=0.2):
+                 ranking_loss_weight=0.2,
+                 focal_gamma=0.0):
         super(HungarianPointLoss, self).__init__()
-        
+
         self.inside_bbox_weight = inside_bbox_weight
         self.outside_bbox_weight = outside_bbox_weight
         self.match_cost = match_cost
@@ -40,6 +41,7 @@ class HungarianPointLoss(nn.Module):
         self.neighbor_soft_label_weight = neighbor_soft_label_weight
         self.ranking_margin = ranking_margin
         self.ranking_loss_weight = ranking_loss_weight
+        self.focal_gamma = focal_gamma
         
     def parse_coordinates_from_text(self, text_outputs, image_width, image_height):
         """
@@ -353,6 +355,15 @@ class HungarianPointLoss(nn.Module):
             pos_weight=pos_weight,
             reduction='none'
         )
+
+        # Focal Loss: 对难分样本加权 (1-pt)^gamma
+        if self.focal_gamma > 0:
+            probs = torch.sigmoid(pred_grid_logits)
+            # pt = p 当 target=1, pt = 1-p 当 target=0
+            pt = probs * grid_targets + (1 - probs) * (1 - grid_targets)
+            focal_weight = (1 - pt).pow(self.focal_gamma)
+            bce_loss = focal_weight * bce_loss
+
         sample_losses = bce_loss.mean(dim=-1)
         total_loss = sample_losses.mean()
         ranking_loss = self._grid_ranking_loss(pred_grid_logits, grid_targets)

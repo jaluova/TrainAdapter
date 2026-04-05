@@ -2,16 +2,49 @@
 数据集类：加载grefs_with_grids.json数据，构建训练样本
 """
 import json
+import math
 import os
 import random
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import numpy as np
+from torchvision import transforms as T
 from transformers import AutoTokenizer
 
 
 GRID_DIVISIONS = 10.0
+
+# 水平翻转时的方位词交换映射
+_FLIP_KEYWORD_PAIRS = [
+    ('leftmost', 'rightmost'), ('rightmost', 'leftmost'),
+    ('left', 'right'), ('right', 'left'),
+    ('最左', '最右'), ('最右', '最左'),
+    ('左', '右'), ('右', '左'),
+]
+
+
+def flip_spatial_keywords(query):
+    """水平翻转时交换查询中的方位词（left↔right, 左↔右）。"""
+    result = query
+    # 用占位符避免 left→right→left 的循环替换
+    placeholders = {}
+    for i, (src, dst) in enumerate(_FLIP_KEYWORD_PAIRS):
+        placeholder = f'\x00FLIP{i}\x00'
+        placeholders[placeholder] = dst
+        result = result.replace(src, placeholder)
+    for placeholder, dst in placeholders.items():
+        result = result.replace(placeholder, dst)
+    return result
+
+
+def flip_grid_target_horizontal(grid_target, grid_size=11):
+    """水平翻转 grid_target：reshape 为 grid_size x grid_size，左右翻转，再 flatten。"""
+    target_2d = grid_target.view(grid_size, grid_size)
+    flipped_2d = target_2d.flip(dims=[1])  # 水平翻转（沿列方向）
+    return flipped_2d.reshape(-1)
+
+
 DEFAULT_RELATION_KEYWORDS = (
     'left', 'right', 'top', 'bottom', 'front', 'behind', 'between', 'with', 'and',
     'center', 'middle', 'near', 'nearest', 'closest', 'far', 'furthest',
@@ -150,11 +183,13 @@ def build_grid_target(
     grid_points,
     grid_size=11,
     neighbor_soft_label_weight=0.3,
-    use_primary_point_only=False
+    use_primary_point_only=False,
+    gaussian_sigma=0.0
 ):
     """
     将离散网格点转换成 [grid_size * grid_size] 的 soft multi-hot 监督。
-    真值点为 1.0，8 邻域平滑为 neighbor_soft_label_weight。
+    真值点为 1.0。
+    gaussian_sigma > 0 时使用距离衰减的 Gaussian 权重，否则使用固定邻域权重。
     """
     target = torch.zeros(grid_size * grid_size, dtype=torch.float32)
     if use_primary_point_only:
@@ -162,6 +197,8 @@ def build_grid_target(
         discrete_points = [primary_point] if primary_point is not None else []
     else:
         discrete_points = flatten_grid_points(grid_points)
+
+    use_gaussian = gaussian_sigma > 0
 
     for point in discrete_points:
         x = int(round(point[0]))
@@ -172,21 +209,36 @@ def build_grid_target(
         center_index = y * grid_size + x
         target[center_index] = 1.0
 
-        if neighbor_soft_label_weight <= 0:
-            continue
-
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                nx = x + dx
-                ny = y + dy
-                if 0 <= nx < grid_size and 0 <= ny < grid_size:
-                    neighbor_index = ny * grid_size + nx
-                    target[neighbor_index] = max(
-                        target[neighbor_index].item(),
-                        float(neighbor_soft_label_weight)
-                    )
+        if use_gaussian:
+            # Gaussian 软标签：权重随距离衰减
+            radius = max(1, int(math.ceil(2 * gaussian_sigma)))
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < grid_size and 0 <= ny < grid_size:
+                        dist_sq = dx * dx + dy * dy
+                        weight = math.exp(-dist_sq / (2 * gaussian_sigma * gaussian_sigma))
+                        neighbor_index = ny * grid_size + nx
+                        target[neighbor_index] = max(
+                            target[neighbor_index].item(),
+                            weight
+                        )
+        elif neighbor_soft_label_weight > 0:
+            # 固定邻域权重（原始逻辑）
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx = x + dx
+                    ny = y + dy
+                    if 0 <= nx < grid_size and 0 <= ny < grid_size:
+                        neighbor_index = ny * grid_size + nx
+                        target[neighbor_index] = max(
+                            target[neighbor_index].item(),
+                            float(neighbor_soft_label_weight)
+                        )
 
     return target
 
@@ -390,11 +442,14 @@ class CoordinateDataset(Dataset):
                  grid_size=11,
                  neighbor_soft_label_weight=0.3,
                  use_primary_grid_target=False,
+                 gaussian_sigma=0.0,
                  relation_keywords=None,
                  ordinal_keywords=None,
                  multi_entity_keywords=None,
                  color_keywords=None,
-                 filter_ordinal_queries=False):
+                 filter_ordinal_queries=False,
+                 horizontal_flip=False,
+                 color_jitter=False):
         """
         Args:
             data_root: 数据根目录
@@ -406,6 +461,9 @@ class CoordinateDataset(Dataset):
             max_length: 文本最大长度
             transform: 图像变换
             filter_ordinal_queries: 过滤顺序查询（gRefCOCO标注存在系统性错误）
+            horizontal_flip: 查询感知水平翻转
+            color_jitter: 颜色抖动
+            gaussian_sigma: Gaussian 软标签 sigma (0=使用固定邻域权重)
         """
         self.data_root = data_root
         self.image_dir = image_dir
@@ -420,7 +478,13 @@ class CoordinateDataset(Dataset):
         self.grid_size = grid_size
         self.neighbor_soft_label_weight = neighbor_soft_label_weight
         self.use_primary_grid_target = use_primary_grid_target
+        self.gaussian_sigma = gaussian_sigma
         self.filter_ordinal_queries = filter_ordinal_queries
+        self.horizontal_flip = horizontal_flip
+        self.color_jitter_transform = (
+            T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+            if color_jitter else None
+        )
         self.relation_keywords = tuple(relation_keywords or DEFAULT_RELATION_KEYWORDS)
         self.ordinal_keywords = tuple(ordinal_keywords or DEFAULT_ORDINAL_KEYWORDS)
         self.multi_entity_keywords = tuple(multi_entity_keywords or DEFAULT_MULTI_ENTITY_KEYWORDS)
@@ -606,9 +670,33 @@ class CoordinateDataset(Dataset):
         else:
             # 如果网格图像不存在，使用原始图像（后期会添加网格）
             grid_image = image.clone()
-        
+
+        # 2.5 数据增强
+        query = sample['query']
+        augmented_grid_points = sample['grid_points']
+
+        # Color Jitter: 只对原始图片，不影响网格图
+        if self.color_jitter_transform is not None and random.random() < 0.5:
+            # tensor [C,H,W] float → PIL → jitter → tensor
+            img_pil = T.ToPILImage()(image)
+            img_pil = self.color_jitter_transform(img_pil)
+            image = T.ToTensor()(img_pil)
+
+        # 水平翻转: 同时翻转图片、网格图、坐标、方位词
+        if self.horizontal_flip and random.random() < 0.5:
+            image = torch.flip(image, dims=[-1])
+            grid_image = torch.flip(grid_image, dims=[-1])
+            # 翻转离散网格坐标: x → (grid_size - 1 - x)
+            raw_points = flatten_grid_points(augmented_grid_points)
+            flipped_points = [
+                [float(self.grid_size - 1 - p[0]), p[1]] for p in raw_points
+            ]
+            augmented_grid_points = flipped_points
+            # 翻转方位词
+            query = flip_spatial_keywords(query)
+
         # 3. 构建文本指令
-        instruction = self._build_instruction(sample['query'])
+        instruction = self._build_instruction(query)
         
         # 4. 编码文本
         encoding = self.tokenizer(
@@ -627,11 +715,11 @@ class CoordinateDataset(Dataset):
             image_width, image_height = img.size
         
         # 6. 构建输出
-        normalized_all_points = normalize_grid_points(sample['grid_points'])
+        normalized_all_points = normalize_grid_points(augmented_grid_points)
         if self.output_mode == 'grid_logits':
             gt_points = normalized_all_points
         else:
-            gt_points = self._normalize_grid_points(sample['grid_points'])
+            gt_points = self._normalize_grid_points(augmented_grid_points)
 
         data = {
             'image': image,
@@ -640,19 +728,20 @@ class CoordinateDataset(Dataset):
             'attention_mask': attention_mask,
             'gt_points': gt_points,
             'grid_target': build_grid_target(
-                sample['grid_points'],
+                augmented_grid_points,
                 grid_size=self.grid_size,
                 neighbor_soft_label_weight=self.neighbor_soft_label_weight,
-                use_primary_point_only=self.use_primary_grid_target
+                use_primary_point_only=self.use_primary_grid_target,
+                gaussian_sigma=self.gaussian_sigma
             ),
             'image_size': (image_width, image_height),
-            'query': sample['query'],
+            'query': query,
             'instruction': instruction,
             'target_coordinate_mode': self.target_coordinate_mode,
-            'is_relation_query': is_relation_query(sample['query'], self.relation_keywords),
-            'is_color_query': sample.get('is_color_query', is_color_query(sample['query'], self.color_keywords)),
-            'is_ordinal_query': is_ordinal_query(sample['query'], self.ordinal_keywords),
-            'is_multi_entity_query': is_multi_entity_query(sample['query'], self.multi_entity_keywords),
+            'is_relation_query': is_relation_query(query, self.relation_keywords),
+            'is_color_query': is_color_query(query, self.color_keywords),
+            'is_ordinal_query': is_ordinal_query(query, self.ordinal_keywords),
+            'is_multi_entity_query': is_multi_entity_query(query, self.multi_entity_keywords),
             'difficulty_tag': sample['difficulty_tag'],
             'image_sample_count': sample.get('image_sample_count', 1),
             'gt_point_count': sample.get('gt_point_count', len(gt_points)),

@@ -110,10 +110,10 @@ class BaseCoordinateAdapter(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
         # 2D位置编码: 让grid classifier知道每个logit对应的空间位置
+        # 用 sinusoidal 初始化，让模型一开始就知道空间布局
         self.grid_position_embedding = nn.Parameter(
-            torch.zeros(1, self.num_grid_logits, visual_dim)
+            self._build_2d_sinusoidal_embedding(grid_size, visual_dim)
         )
-        nn.init.trunc_normal_(self.grid_position_embedding, std=0.02)
 
         self.grid_classifier = nn.Sequential(
             nn.LayerNorm(visual_dim),
@@ -131,6 +131,24 @@ class BaseCoordinateAdapter(nn.Module):
         )
 
         self._initialize_weights()
+
+    @staticmethod
+    def _build_2d_sinusoidal_embedding(grid_size, dim):
+        """构建 2D sinusoidal 位置编码 [1, grid_size^2, dim]。"""
+        import math
+        num_positions = grid_size * grid_size
+        embedding = torch.zeros(num_positions, dim)
+        quarter = dim // 4
+        for idx in range(num_positions):
+            y = idx // grid_size
+            x = idx % grid_size
+            for d in range(quarter):
+                freq = 1.0 / (10000.0 ** (2.0 * d / dim))
+                embedding[idx, 4 * d] = math.sin(x * freq)
+                embedding[idx, 4 * d + 1] = math.cos(x * freq)
+                embedding[idx, 4 * d + 2] = math.sin(y * freq)
+                embedding[idx, 4 * d + 3] = math.cos(y * freq)
+        return embedding.unsqueeze(0)  # [1, grid_size^2, dim]
 
     def _initialize_weights(self):
         for module in self.modules():

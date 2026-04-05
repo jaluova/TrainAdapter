@@ -60,7 +60,7 @@ class DataConfig:
     use_data_augmentation: bool = True
     color_jitter: bool = True
     random_resized_crop: bool = True
-    horizontal_flip: bool = False  # 坐标会变化，慎用
+    horizontal_flip: bool = True  # 查询感知水平翻转（同时交换方位词）
 
     # 监督目标
     target_point_strategy: str = 'fps'
@@ -137,8 +137,10 @@ class TrainingConfig:
     boundary_penalty_weight: float = 0.1
     grid_pos_weight: float = 4.0
     neighbor_soft_label_weight: float = 0.12
+    grid_target_gaussian_sigma: float = 1.0  # Gaussian 软标签 sigma (0=使用固定邻域权重)
     ranking_margin: float = 0.2
     ranking_loss_weight: float = 0.25
+    focal_gamma: float = 2.0  # Focal Loss gamma (0=普通BCE, 2.0=推荐)
     use_primary_grid_target: bool = False
     use_amp: bool = False
 
